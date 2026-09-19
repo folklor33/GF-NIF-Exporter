@@ -1,0 +1,386 @@
+#include "nif/MeshExtractor.hpp"
+
+#include "nif/HeaderNormalizer.hpp"
+#include "nif/MaterialExtractor.hpp"
+#include "texture/TextureResolver.hpp"
+
+#include "niflib.h"
+#include "nif_math.h"
+#include "obj/NiAVObject.h"
+#include "obj/NiGeometry.h"
+#include "obj/NiGeometryData.h"
+#include "obj/NiNode.h"
+#include "obj/NiObject.h"
+#include "obj/NiTriShape.h"
+#include "obj/NiTriShapeData.h"
+#include "obj/NiTriStrips.h"
+#include "obj/NiTriStripsData.h"
+
+#include <cmath>
+#include <exception>
+#include <set>
+#include <sstream>
+#include <vector>
+
+namespace gfnif {
+namespace {
+
+using Niflib::Matrix44;
+using Niflib::NiObject;
+using Niflib::NiObjectRef;
+
+/*! Transforms a position by a niflib Matrix44.
+ *
+ *  niflib uses the row-vector convention (v * M) with translation in row 3 --
+ *  see Matrix44::operator*(Vector3) in niflib's src/nif_math.cpp. */
+void TransformPosition(const Matrix44& m, const Niflib::Vector3& in, float (&out)[3]) {
+    out[0] = in.x * m[0][0] + in.y * m[1][0] + in.z * m[2][0] + m[3][0];
+    out[1] = in.x * m[0][1] + in.y * m[1][1] + in.z * m[2][1] + m[3][1];
+    out[2] = in.x * m[0][2] + in.y * m[1][2] + in.z * m[2][2] + m[3][2];
+}
+
+/*! Transforms a direction by the rotation/scale part only (translation row
+ *  dropped), then renormalises.
+ *
+ *  Using the plain upper 3x3 rather than its inverse-transpose is correct for
+ *  the rigid + uniform-scale transforms NIF nodes carry; GF models use uniform
+ *  scale only (NiAVObject stores scale as a single float, so non-uniform scale
+ *  cannot even be expressed). */
+void TransformNormal(const Matrix44& m, const Niflib::Vector3& in, float (&out)[3]) {
+    float x = in.x * m[0][0] + in.y * m[1][0] + in.z * m[2][0];
+    float y = in.x * m[0][1] + in.y * m[1][1] + in.z * m[2][1];
+    float z = in.x * m[0][2] + in.y * m[1][2] + in.z * m[2][2];
+    const float len = std::sqrt(x * x + y * y + z * z);
+    if (len > 1e-12f) {
+        x /= len;
+        y /= len;
+        z /= len;
+    } else {
+        x = 0.0f;
+        y = 0.0f;
+        z = 1.0f;
+    }
+    out[0] = x;
+    out[1] = y;
+    out[2] = z;
+}
+
+/*! Converts a triangle strip into an indexed triangle list.
+ *
+ *  A strip encodes triangle i as (s[i], s[i+1], s[i+2]) with the winding order
+ *  alternating every step, so odd-numbered triangles have two indices swapped
+ *  to keep a consistent facing.
+ *
+ *  Degenerate triangles -- ones where two of the three indices are equal -- are
+ *  dropped. They are not errors: repeating an index is the standard way to
+ *  stitch several strips into one, and they cover zero area, so a renderer
+ *  gains nothing from them. `degenerateCount` accumulates how many were seen,
+ *  which Phase 2 reports across the corpus as a sanity check.
+ *
+ *  Indices are widened to uint32_t on output even though NIF stores them as
+ *  unsigned short, so the format does not need changing if a later asset
+ *  exceeds 65535 vertices. */
+void DeStripify(const std::vector<unsigned short>& strip,
+                std::vector<uint32_t>& outIndices,
+                int& degenerateCount) {
+    if (strip.size() < 3) {
+        return;
+    }
+    for (size_t i = 0; i + 2 < strip.size(); ++i) {
+        unsigned short a = strip[i];
+        unsigned short b = strip[i + 1];
+        unsigned short c = strip[i + 2];
+
+        if (a == b || b == c || a == c) {
+            ++degenerateCount;
+            continue;
+        }
+
+        // Odd triangles are wound the other way round; swap to normalise.
+        if (i % 2 == 0) {
+            outIndices.push_back(a);
+            outIndices.push_back(b);
+            outIndices.push_back(c);
+        } else {
+            outIndices.push_back(a);
+            outIndices.push_back(c);
+            outIndices.push_back(b);
+        }
+    }
+}
+
+/*! Copies the vertex attributes of one geometry, baking `world` into positions
+ *  and normals. */
+void BuildVertices(Niflib::NiGeometryData* data,
+                   const Matrix44& world,
+                   bool materialHasVertexColor,
+                   std::vector<StaticVertex>& out) {
+    const std::vector<Niflib::Vector3> positions = data->GetVertices();
+    const std::vector<Niflib::Vector3> normals = data->GetNormals();
+    const std::vector<Niflib::Color4> colors = data->GetColors();
+
+    // UV set 0 is the diffuse channel. GetUVSet throws when there are none, so
+    // the count is checked first.
+    std::vector<Niflib::TexCoord> uvs;
+    if (data->GetUVSetCount() > 0) {
+        uvs = data->GetUVSet(0);
+    }
+
+    out.resize(positions.size());
+    for (size_t i = 0; i < positions.size(); ++i) {
+        StaticVertex& v = out[i];
+        TransformPosition(world, positions[i], v.position);
+
+        if (i < normals.size()) {
+            TransformNormal(world, normals[i], v.normal);
+        }
+        if (i < uvs.size()) {
+            v.uv[0] = uvs[i].u;
+            v.uv[1] = uvs[i].v;
+        }
+        // Vertex colors are only meaningful when the material advertises them;
+        // otherwise the default opaque white in StaticVertex is kept, so the
+        // attribute is always safe to read.
+        if (materialHasVertexColor && i < colors.size()) {
+            v.color[0] = colors[i].r;
+            v.color[1] = colors[i].g;
+            v.color[2] = colors[i].b;
+            v.color[3] = colors[i].a;
+        }
+    }
+}
+
+/*! Walks the node tree, accumulating transforms and emitting one MeshData per
+ *  geometry block found.
+ *
+ *  `visited` guards against the DAG sharing that is normal in NIF files: a node
+ *  can be referenced from more than one parent, and following it twice would
+ *  duplicate geometry (or loop forever). */
+void WalkNode(Niflib::NiAVObject* obj,
+              const Matrix44& parentWorld,
+              SceneData& scene,
+              MaterialExtractor& materials,
+              std::set<NiObject*>& visited,
+              ExtractionResult& result,
+              int depth,
+              bool verifyStrips) {
+    if (obj == nullptr || !visited.insert(obj).second) {
+        return;
+    }
+    if (depth > result.maxDepthSeen) {
+        result.maxDepthSeen = depth;
+    }
+    // Guard against pathological nesting exhausting the stack. NIF hierarchies
+    // are shallow in practice (see PHASE2_FINDINGS); anything past this is
+    // malformed, and bailing out beats taking the process down.
+    if (depth > kMaxNodeDepth) {
+        result.warnings.push_back("node hierarchy deeper than " +
+                                  std::to_string(kMaxNodeDepth) + "; subtree skipped");
+        return;
+    }
+
+    // niflib composes as local * parentWorld (row-vector convention).
+    const Matrix44 world = obj->GetLocalTransform() * parentWorld;
+
+    if (auto* node = dynamic_cast<Niflib::NiNode*>(obj)) {
+        for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
+            WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, visited,
+                     result, depth + 1, verifyStrips);
+        }
+        return;
+    }
+
+    auto* triShape = dynamic_cast<Niflib::NiTriShape*>(obj);
+    auto* triStrips = dynamic_cast<Niflib::NiTriStrips*>(obj);
+    if (triShape == nullptr && triStrips == nullptr) {
+        return; // Not geometry (a particle system, a camera, ...). Not our phase.
+    }
+
+    auto* geom = static_cast<Niflib::NiGeometry*>(obj);
+    Niflib::NiGeometryData* data = geom->GetData();
+    if (data == nullptr) {
+        result.warnings.push_back("geometry '" + obj->GetName() + "' has no data block; skipped");
+        ++result.geometriesSkipped;
+        return;
+    }
+
+    MeshData mesh;
+    mesh.name = obj->GetName();
+    mesh.materialIndex = materials.ExtractFor(obj, scene.materials);
+
+    const bool hasVertexColor = mesh.materialIndex >= 0 &&
+                                scene.materials[mesh.materialIndex].hasVertexColor;
+
+    if (triShape != nullptr) {
+        mesh.source = MeshData::Source::TriShape;
+        // NiTriShapeData already stores an explicit triangle list. GetTriangles
+        // is declared on NiTriBasedGeomData, below the NiGeometryData that
+        // GetData() hands back, so the data block is narrowed first.
+        auto* shapeData = dynamic_cast<Niflib::NiTriShapeData*>(data);
+        if (shapeData == nullptr) {
+            result.warnings.push_back("NiTriShape '" + mesh.name +
+                                      "' has non-trishape data block; skipped");
+            ++result.geometriesSkipped;
+            return;
+        }
+        for (const Niflib::Triangle& t : shapeData->GetTriangles()) {
+            mesh.indices.push_back(t.v1);
+            mesh.indices.push_back(t.v2);
+            mesh.indices.push_back(t.v3);
+        }
+    } else {
+        mesh.source = MeshData::Source::TriStrips;
+        auto* stripData = dynamic_cast<Niflib::NiTriStripsData*>(data);
+        if (stripData == nullptr) {
+            result.warnings.push_back("NiTriStrips '" + mesh.name +
+                                      "' has non-strip data block; skipped");
+            ++result.geometriesSkipped;
+            return;
+        }
+        const int stripCount = stripData->GetStripCount();
+        size_t candidateTriangles = 0;
+        for (int s = 0; s < stripCount; ++s) {
+            const std::vector<unsigned short> strip = stripData->GetStrip(s);
+            if (strip.size() >= 3) {
+                candidateTriangles += strip.size() - 2;
+            }
+            DeStripify(strip, mesh.indices, mesh.degenerateTrianglesDropped);
+        }
+        result.degenerateTrianglesDropped += mesh.degenerateTrianglesDropped;
+
+        // Invariant: a strip of length L yields exactly L-2 candidate triangles,
+        // each either kept or dropped as degenerate. A mismatch would mean the
+        // de-striping lost or invented geometry.
+        const size_t emitted = mesh.indices.size() / 3;
+        if (emitted + static_cast<size_t>(mesh.degenerateTrianglesDropped) != candidateTriangles) {
+            result.warnings.push_back("de-striping invariant violated on '" + mesh.name + "': " +
+                                      std::to_string(emitted) + " kept + " +
+                                      std::to_string(mesh.degenerateTrianglesDropped) +
+                                      " dropped != " + std::to_string(candidateTriangles) +
+                                      " candidates");
+        }
+
+        // Cross-check against niflib's own strip expansion. niflib drops
+        // degenerate triangles too, so its triangle count must equal the number
+        // we keep -- that is the number a renderer actually draws.
+        if (verifyStrips) {
+            const size_t niflibTriangles = stripData->GetTriangles().size();
+            if (niflibTriangles != emitted) {
+                result.warnings.push_back(
+                    "strip cross-check on '" + mesh.name + "': niflib expands to " +
+                    std::to_string(niflibTriangles) + " triangles, we kept " +
+                    std::to_string(emitted));
+            }
+        }
+    }
+
+    BuildVertices(data, world, hasVertexColor, mesh.vertices);
+
+    if (mesh.vertices.empty() || mesh.indices.empty()) {
+        result.warnings.push_back("geometry '" + mesh.name + "' produced no triangles; skipped");
+        ++result.geometriesSkipped;
+        return;
+    }
+
+    // Guard the export against an out-of-range index rather than letting a
+    // malformed file produce a .gfbin that crashes the viewer.
+    const uint32_t vertexCount = static_cast<uint32_t>(mesh.vertices.size());
+    for (uint32_t idx : mesh.indices) {
+        if (idx >= vertexCount) {
+            result.warnings.push_back("geometry '" + mesh.name + "' has out-of-range index " +
+                                      std::to_string(idx) + " (>= " + std::to_string(vertexCount) +
+                                      "); skipped");
+            ++result.geometriesSkipped;
+            return;
+        }
+    }
+
+    scene.meshes.push_back(std::move(mesh));
+}
+
+} // namespace
+
+ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool verifyStrips) {
+    ExtractionResult result;
+    scene = SceneData();
+    scene.sourceNifPath = nifPath;
+
+    std::string bytes;
+    if (!ReadWholeFile(nifPath, bytes)) {
+        result.error = "cannot open file";
+        return result;
+    }
+
+    HeaderNormalizationReport header;
+    NormalizeNifHeader(bytes, header);
+    if (header.repairedTruncatedHeaderString) {
+        result.warnings.push_back("header string was truncated (\"" + header.originalHeaderString +
+                                  "\"); rebuilt in memory");
+    }
+    if (header.restampedVersion) {
+        result.warnings.push_back("version stamped " + FormatNifVersion(header.originalVersion) +
+                                  " over a 20.2.0.8 layout; restamped in memory");
+    }
+
+    // niflib crashes rather than throwing cleanly on a block type it does not
+    // implement, so the header's type table is checked first and the file
+    // skipped if anything in it is unsupported. See HeaderNormalizer.cpp.
+    const std::string unsupported = FindUnsupportedBlockType(bytes);
+    if (!unsupported.empty()) {
+        result.error = "unsupported block type '" + unsupported + "' (niflib cannot read it)";
+        return result;
+    }
+
+    std::vector<NiObjectRef> blocks;
+    try {
+        std::istringstream stream(bytes, std::ios::binary);
+        blocks = Niflib::ReadNifList(stream, nullptr);
+    } catch (const std::exception& e) {
+        result.error = std::string("niflib parse failed: ") + e.what();
+        return result;
+    } catch (...) {
+        result.error = "niflib parse failed: unknown exception";
+        return result;
+    }
+
+    if (blocks.empty()) {
+        result.error = "file contains no blocks";
+        return result;
+    }
+
+    TextureResolver resolver(nifPath);
+    MaterialExtractor materials(resolver, &result.warnings);
+
+    // Roots are the blocks nothing else references. Starting from every root
+    // (rather than assuming block 0) keeps files with several top-level nodes
+    // working.
+    std::set<NiObject*> referenced;
+    for (const NiObjectRef& b : blocks) {
+        for (const NiObjectRef& r : static_cast<NiObject*>(b)->GetRefs()) {
+            if (r != NULL) {
+                referenced.insert(static_cast<NiObject*>(r));
+            }
+        }
+    }
+
+    std::set<NiObject*> visited;
+    for (const NiObjectRef& b : blocks) {
+        NiObject* obj = static_cast<NiObject*>(b);
+        if (referenced.find(obj) != referenced.end()) {
+            continue;
+        }
+        if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
+            WalkNode(av, Matrix44::IDENTITY, scene, materials, visited, result, 0, verifyStrips);
+        }
+    }
+
+    if (scene.meshes.empty()) {
+        result.error = "no geometry found (" + std::to_string(blocks.size()) + " blocks parsed)";
+        return result;
+    }
+
+    result.success = true;
+    return result;
+}
+
+} // namespace gfnif

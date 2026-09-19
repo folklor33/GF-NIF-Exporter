@@ -76,7 +76,12 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(gfnif-export
     src/main.cpp
+    src/export/GfxFormatWriter.cpp
+    src/nif/HeaderNormalizer.cpp
+    src/nif/MaterialExtractor.cpp
+    src/nif/MeshExtractor.cpp
     src/nif/NifDumper.cpp
+    src/texture/TextureResolver.cpp
 )
 target_include_directories(gfnif-export PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gfnif-export PRIVATE niflib_static)
@@ -84,6 +89,15 @@ target_link_libraries(gfnif-export PRIVATE niflib_static)
 if(MSVC)
     # Our own code is held to conformance mode, unlike niflib.
     target_compile_options(gfnif-export PRIVATE /permissive-)
+endif()
+
+# Opt-in AddressSanitizer build for diagnosing memory errors across a long run:
+#   cmake -S . -B build-asan -DGFNIF_ASAN=ON && cmake --build build-asan --config Debug
+option(GFNIF_ASAN "Build with AddressSanitizer" OFF)
+if(GFNIF_ASAN AND MSVC)
+    target_compile_options(gfnif-export PRIVATE /fsanitize=address /Zi)
+    target_compile_options(niflib_static PRIVATE /fsanitize=address /Zi)
+    target_link_options(gfnif-export PRIVATE /INCREMENTAL:NO)
 endif()
 
 if(MSVC)

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>gfmodel viewer</title>
+<!--
+  Throwaway Phase 2 validation viewer.
+
+  Not part of the Angular deliverable: this exists only to eyeball the exported
+  geometry, UVs and materials. Three.js comes from a CDN, everything else is
+  inline, and there is no build step.
+
+  Serve the repo root over HTTP so the exported files and the input textures are
+  both reachable, e.g.:
+      python -m http.server 8000
+      http://localhost:8000/tools/viewer/?model=/out/monster/model/M011.gfmodel
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 system-ui,sans-serif; background:#15171c; color:#e6e8ee; overflow:hidden; }
+  #ui { position:fixed; top:0; left:0; right:0; padding:10px 14px; background:#1d2027ee;
+        border-bottom:1px solid #2e333d; display:flex; gap:14px; align-items:center; flex-wrap:wrap; z-index:10; }
+  #ui label { cursor:pointer; }
+  #stats { position:fixed; bottom:0; left:0; padding:8px 14px; background:#1d2027ee;
+           border-top:1px solid #2e333d; border-right:1px solid #2e333d; font-family:ui-monospace,monospace;
+           white-space:pre; z-index:10; max-height:45vh; overflow:auto; }
+  input[type=text] { background:#12141a; border:1px solid #333a45; color:#e6e8ee; padding:5px 8px;
+                     border-radius:4px; width:min(460px,42vw); font-family:ui-monospace,monospace; }
+  button { background:#2b5cd6; border:0; color:#fff; padding:6px 12px; border-radius:4px; cursor:pointer; }
+  button:hover { background:#3a6ae8; }
+  .warn { color:#ffcc66; }
+  .err  { color:#ff7b72; }
+  .ok   { color:#7ee787; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <strong>gfmodel</strong>
+  <input type="text" id="path" placeholder="/out/monster/model/M011.gfmodel">
+  <button id="load">Load</button>
+  <span>or</span>
+  <input type="file" id="files" multiple accept=".gfmodel,.gfbin,.png">
+  <label><input type="checkbox" id="wire"> wireframe</label>
+  <label><input type="checkbox" id="tex" checked> textures</label>
+  <label><input type="checkbox" id="vcol" checked> vertex colors</label>
+  <label><input type="checkbox" id="zup" checked> Z-up &rarr; Y-up</label>
+</div>
+<div id="stats">no model loaded</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const statsEl = document.getElementById('stats');
+const log = (html) => { statsEl.innerHTML = html; };
+
+// ---------------------------------------------------------------- scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+renderer.domElement.style.position = 'fixed';
+renderer.domElement.style.inset = '0';
+renderer.domElement.style.zIndex = '1';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x15171c);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 100000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.4));
+const key = new THREE.DirectionalLight(0xffffff, 2.0);
+key.position.set(1, 2, 1.5);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0xffffff, 0.8);
+fill.position.set(-1.5, -0.5, -1);
+scene.add(fill);
+
+const grid = new THREE.GridHelper(200, 20, 0x3a4150, 0x262b34);
+scene.add(grid);
+
+let root = new THREE.Group();
+scene.add(root);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+
+// ------------------------------------------------------------------- building
+// Maps the .gfmodel accessor descriptors onto BufferAttributes. Each accessor
+// is {byteOffset, itemSize, count, type} into the single .gfbin buffer, so no
+// parsing or reshaping is needed here -- the ranges are used as-is.
+function attr(buffer, acc) {
+  if (!acc || acc.count === 0) return null;
+  const a = new Float32Array(buffer, acc.byteOffset, acc.count * acc.itemSize);
+  return new THREE.BufferAttribute(a, acc.itemSize);
+}
+
+function buildScene(model, bin, textureUrlFor) {
+  const group = new THREE.Group();
+  const showTex = document.getElementById('tex').checked;
+  const showVcol = document.getElementById('vcol').checked;
+  const wire = document.getElementById('wire').checked;
+  const loader = new THREE.TextureLoader();
+  const notes = [];
+
+  for (const m of model.meshes) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', attr(bin, m.attributes.position));
+
+    const n = attr(bin, m.attributes.normal);
+    if (n) g.setAttribute('normal', n);
+    const uv = attr(bin, m.attributes.uv);
+    if (uv) g.setAttribute('uv', uv);
+
+    const mat = model.materials[m.materialIndex] || {};
+    const useVcol = showVcol && mat.hasVertexColor;
+    if (useVcol) {
+      const c = attr(bin, m.attributes.color);
+      if (c) g.setAttribute('color', c);
+    }
+
+    const idx = new Uint32Array(bin, m.indices.byteOffset, m.indices.count);
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    if (!n) g.computeVertexNormals();
+    g.computeBoundingSphere();
+
+    const params = {
+      side: THREE.DoubleSide,   // GF meshes are frequently single-sided planes
+      wireframe: wire,
+      vertexColors: useVcol,
+      metalness: 0.0,
+      roughness: 0.85,
+    };
+    if (mat.diffuse) params.color = new THREE.Color(...mat.diffuse);
+    if (mat.alpha !== undefined && mat.alpha < 1) {
+      params.transparent = true;
+      params.opacity = mat.alpha;
+    }
+
+    const material = new THREE.MeshStandardMaterial(params);
+
+    if (showTex && mat.textureFound && mat.diffuseTexturePath) {
+      const url = textureUrlFor(mat.diffuseTexturePath);
+      if (url) {
+        const t = loader.load(url,
+          undefined, undefined,
+          () => notes.push(`<span class="warn">texture failed to load: ${mat.diffuseTexturePath}</span>`));
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        // NIF UVs have V running the other way from glTF/Three.
+        t.flipY = false;
+        material.map = t;
+      }
+    } else if (mat.sourceTextureName && !mat.textureFound) {
+      notes.push(`<span class="warn">unresolved texture: ${mat.sourceTextureName}</span>`);
+    }
+
+    group.add(new THREE.Mesh(g, material));
+  }
+
+  // NIF/Gamebryo is Z-up; Three.js is Y-up. The exporter deliberately keeps the
+  // source axes (converting is a consumer-side decision, and Phase 3's skeleton
+  // has to agree with whatever choice is made), so the viewer rotates for
+  // display only.
+  if (document.getElementById('zup').checked) {
+    group.rotation.x = -Math.PI / 2;
+  }
+  return { group, notes };
+}
+
+function frame(group) {
+  // setFromObject reads world matrices, so the Z-up rotation must be baked in
+  // before the bounds are measured.
+  group.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(group);
+  if (box.isEmpty()) return;
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.5 || 1;
+
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(radius * 2.2, radius * 1.6, radius * 2.2));
+  camera.near = radius / 100;
+  camera.far = radius * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+
+  grid.position.set(center.x, box.min.y, center.z);
+  grid.scale.setScalar(Math.max(radius / 10, 0.01));
+}
+
+// Remembers the last load so the wireframe/texture/vertex-color checkboxes can
+// rebuild without re-fetching.
+let lastReload = null;
+
+function show(model, bin, textureUrlFor) {
+  lastReload = () => show(model, bin, textureUrlFor);
+  scene.remove(root);
+  root.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+  });
+
+  const { group, notes } = buildScene(model, bin, textureUrlFor);
+  root = group;
+  scene.add(root);
+  frame(root);
+
+  const tris = model.meshes.reduce((a, m) => a + m.indexCount / 3, 0);
+  const verts = model.meshes.reduce((a, m) => a + m.vertexCount, 0);
+  const degen = model.meshes.reduce((a, m) => a + (m.degenerateTrianglesDropped || 0), 0);
+  const strips = model.meshes.filter(m => m.sourceTopology === 'NiTriStrips').length;
+  const missing = model.materials.filter(m => m.sourceTextureName && !m.textureFound).length;
+
+  // Signal for the headless screenshot harness: set once geometry is in the
+  // scene and framed. Textures may still be streaming in.
+  window.__gfLoaded = { meshes: model.meshes.length, vertices: verts, triangles: tris };
+
+  log([
+    `<span class="ok">${model.sourceNif}</span>`,
+    `meshes ${model.meshes.length}  (${strips} from NiTriStrips)   materials ${model.materials.length}`,
+    `vertices ${verts.toLocaleString()}   triangles ${tris.toLocaleString()}   degenerate dropped ${degen.toLocaleString()}`,
+    missing ? `<span class="warn">${missing} material(s) with unresolved textures</span>` : `<span class="ok">all textures resolved</span>`,
+    ...new Set(notes),
+  ].join('\n'));
+}
+
+// --------------------------------------------------------------- loading: URL
+async function loadFromPath(modelPath) {
+  log('loading ' + modelPath + ' ...');
+  const model = await (await fetch(modelPath)).json();
+  const binPath = modelPath.replace(/[^/]+$/, model.binary);
+  const bin = await (await fetch(binPath)).arrayBuffer();
+
+  // diffuseTexturePath is written relative to wherever the exporter ran, e.g.
+  // "input/monster/texture/M01101.png". Served from the repo root it just works.
+  show(model, bin, p => '/' + p.replace(/^\/+/, ''));
+}
+
+// ------------------------------------------------------- loading: file picker
+function loadFromFiles(fileList) {
+  const files = [...fileList];
+  const modelFile = files.find(f => f.name.endsWith('.gfmodel'));
+  if (!modelFile) { log('<span class="err">pick a .gfmodel (and its .gfbin, plus any .png)</span>'); return; }
+
+  const fr = new FileReader();
+  fr.onload = () => {
+    const model = JSON.parse(fr.result);
+    const binFile = files.find(f => f.name === model.binary)
+                 || files.find(f => f.name.endsWith('.gfbin'));
+    if (!binFile) { log('<span class="err">missing ' + model.binary + '</span>'); return; }
+
+    // Textures the user also picked, matched on basename.
+    const pngs = new Map();
+    for (const f of files) if (f.name.toLowerCase().endsWith('.png')) pngs.set(f.name.toLowerCase(), URL.createObjectURL(f));
+
+    const fr2 = new FileReader();
+    fr2.onload = () => show(model, fr2.result, p => pngs.get(p.split('/').pop().toLowerCase()) || null);
+    fr2.readAsArrayBuffer(binFile);
+  };
+  fr.readAsText(modelFile);
+}
+
+// ------------------------------------------------------------------- wiring
+const pathInput = document.getElementById('path');
+document.getElementById('load').onclick = () => {
+  if (pathInput.value.trim()) loadFromPath(pathInput.value.trim()).catch(e => log('<span class="err">' + e + '</span>'));
+};
+pathInput.onkeydown = e => { if (e.key === 'Enter') document.getElementById('load').click(); };
+document.getElementById('files').onchange = e => loadFromFiles(e.target.files);
+
+for (const id of ['wire', 'tex', 'vcol', 'zup']) {
+  document.getElementById(id).onchange = () => { if (lastReload) lastReload(); };
+}
+
+const qs = new URLSearchParams(location.search).get('model');
+if (qs) { pathInput.value = qs; loadFromPath(qs).catch(e => log('<span class="err">' + e + '</span>')); }
+else log('Enter a path like /out/monster/model/M011.gfmodel, or pick files.\nServe the repo root over HTTP so textures resolve.');
+</script>
+</body>
+</html>
