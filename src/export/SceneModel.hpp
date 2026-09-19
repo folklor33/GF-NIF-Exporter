@@ -14,18 +14,102 @@
 
 namespace gfnif {
 
-/*! One vertex of a static (bind-pose) mesh, already in world space.
+/*! Number of bone influences carried per vertex.
  *
- *  Phase 2 exports a flattened static pose, so positions and normals have the
- *  accumulated NiNode transform baked in. Phase 3 will keep vertices in their
- *  local/bind space instead and carry the transform on the skeleton. */
-struct StaticVertex {
+ *  Four is what glTF, Three.js and the GPU skinning path all expect, and it is
+ *  also what NiSkinPartition already normalises to. Vertices with fewer real
+ *  influences pad with weight 0; vertices with more are truncated to the four
+ *  largest and renormalised (see PHASE3_FINDINGS for the measured rate). */
+constexpr int kInfluencesPerVertex = 4;
+
+/*! One vertex of a mesh.
+ *
+ *  Static (non-skinned) geometry has positions and normals in world space, with
+ *  the accumulated NiNode transform baked in as in Phase 2. Skinned geometry
+ *  instead keeps them *raw*, in the shape's own local space, because the skin
+ *  matrices carry the placement -- baking a node transform in as well would
+ *  apply it twice. See PHASE3_FINDINGS §6.
+ *
+ *  The influence slots are present on every vertex, skinned or not. Carrying
+ *  one vertex type rather than a StaticVertex/SkinnedVertex pair means
+ *  GfxFormatWriter, MeshExtractor and the viewer each have a single code path;
+ *  MeshData::isSkinned says whether the slots hold real data, and the writer
+ *  simply omits the two attributes for an unskinned mesh, so nothing reaches
+ *  the .gfbin that a consumer would have to skip over. */
+struct Vertex {
     float position[3] = {0.0f, 0.0f, 0.0f};
     float normal[3] = {0.0f, 0.0f, 1.0f};
     float uv[2] = {0.0f, 0.0f};
     /*! Opaque white when the source has no NiVertexColorProperty / vertex
      *  colors, so a consumer can always read this attribute unconditionally. */
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    /*! Index into the owning MeshData::skinBindings (glTF "joints"
+     *  semantics), not directly into the skeleton. Meaningless where the
+     *  matching weight is 0. */
+    uint16_t boneIndex[kInfluencesPerVertex] = {0, 0, 0, 0};
+    /*! Influence weights, sorted descending, summing to 1 on a skinned vertex
+     *  and to 0 on an unskinned one. */
+    float weight[kInfluencesPerVertex] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+/*! Kept as an alias so the Phase 2 vocabulary still reads correctly at call
+ *  sites that only touch the static attributes. */
+using StaticVertex = Vertex;
+
+/*! One bone of a skeleton: an entry in the NiNode hierarchy of the file. */
+struct BoneData {
+    /*! The NiNode name, stored exactly as it appears in the file -- no case
+     *  folding, no whitespace trimming. Phase 4 binds .kf tracks to bones by
+     *  this string, and the .kf spells it the same way the .nif does. */
+    std::string name;
+    /*! Index of the parent in SkeletonData::bones, or -1 for the root.
+     *  Parents always precede their children, so a consumer can compute world
+     *  matrices in a single forward pass. */
+    int parentIndex = -1;
+    /*! The bone's rest transform in its parent's space, straight from the
+     *  NiNode's local transform. Column-major (Three.js / glTF order). */
+    float bindMatrixLocal[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    /*! True for a named anchor point -- "Shield Nub", "Right Rope Nub" and
+     *  friends -- where a consumer may want to attach a weapon, shield or
+     *  rope. Advisory only: the bone is an ordinary bone in every other way.
+     *
+     *  Helper-named bones are NEVER removed from the skeleton, whatever their
+     *  role: 1565 of them are the parent of a genuinely named bone, so
+     *  dropping them would break the hierarchy. Only their gizmo *geometry*
+     *  is filtered, in MeshExtractor. */
+    bool isAttachPoint = false;
+};
+
+/*! One bone as used by one particular skinned mesh.
+ *
+ *  The bind matrix lives here rather than on BoneData because it is a property
+ *  of the *skin*, not of the bone: measured on this corpus, two NiSkinInstances
+ *  in the same file routinely give the same NiNode different NiSkinData
+ *  transforms (8227 such conflicts corpus-wide, differing by up to 14.45; N920
+ *  alone has 8). Storing one per bone on the shared skeleton would force us to
+ *  pick a winner and misplace every mesh that wanted the other. glTF splits
+ *  joints and inverseBindMatrices the same way, for the same reason. */
+struct SkinBinding {
+    /*! Index into SkeletonData::bones. */
+    int boneIndex = -1;
+    /*! The complete bind-pose skin matrix for this bone: it takes a vertex of
+     *  this mesh, in the raw local space the positions are stored in, straight
+     *  to its bind-pose world position. Column-major.
+     *
+     *  Equivalent to `boneWorldAtBind * inverseBind` already multiplied out.
+     *  Storing the product rather than the two halves means a consumer never
+     *  has to rebuild the bone's world matrix from the hierarchy just to draw
+     *  the bind pose, and cannot get the multiplication order wrong. */
+    float skinMatrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+};
+
+/*! The bone hierarchy of one file. Bones are in parent-before-child order. */
+struct SkeletonData {
+    /*! Name of the NiNode the hierarchy was walked from. */
+    std::string rootName;
+    std::vector<BoneData> bones;
 };
 
 /*! A single drawable. Both NiTriShape and NiTriStrips collapse into this:
@@ -45,6 +129,19 @@ struct MeshData {
     /*! Degenerate triangles dropped while de-stripifying (always 0 for
      *  TriShape). Reported per corpus as a sanity check on the de-striping. */
     int degenerateTrianglesDropped = 0;
+
+    /*! True when the geometry carried a usable NiSkinInstance, i.e. the
+     *  boneIndex/weight slots on its vertices hold real data and its positions
+     *  are raw shape-local rather than world space. */
+    bool isSkinned = false;
+    /*! Index into SceneData::skeletons, or -1 when not skinned. A file may mix
+     *  skinned and unskinned meshes freely; the unskinned ones keep -1 and are
+     *  drawn with their baked world transform as in Phase 2. */
+    int skeletonIndex = -1;
+    /*! This mesh's bones, in the order Vertex::boneIndex refers to them, each
+     *  with the bind-pose skin matrix this particular skin supplies. Empty when
+     *  not skinned. */
+    std::vector<SkinBinding> skinBindings;
 };
 
 /*! Material parameters, flattened from the NiProperty list attached to a
@@ -62,6 +159,14 @@ struct MaterialData {
     float specular[3] = {0.0f, 0.0f, 0.0f};
     float emissive[3] = {0.0f, 0.0f, 0.0f};
     float glossiness = 0.0f;
+    /*! NiMaterialProperty's transparency scalar, 1.0 = opaque.
+     *
+     *  Clamped to [0, 1] on read: 228 shapes in the corpus store a small
+     *  negative value here (down to -0.88), always alongside a real
+     *  NiAlphaProperty that carries the material's actual blend state -- see
+     *  PHASE2_FINDINGS §12. The field is malformed authoring data on those
+     *  shapes, not a signal to act on; clamping keeps it from producing a
+     *  negative opacity in a consumer that reads it standalone. */
     float alpha = 1.0f;
 
     /*! True when a NiVertexColorProperty is attached, i.e. the vertex color
@@ -70,17 +175,141 @@ struct MaterialData {
     /*! False when the .png for sourceTextureName was not found on disk. The
      *  conversion still succeeds; the consumer falls back to the flat colors. */
     bool textureFound = false;
+
+    /*! False when the geometry has no NiAlphaProperty at all. The material is
+     *  then plain opaque, exactly Phase 2's behaviour -- every field below is
+     *  meaningless in that case and left at its default. */
+    bool hasAlphaProperty = false;
+    /*! Alpha blending on/off, from NiAlphaProperty's flags bit 0. */
+    bool alphaBlendEnabled = false;
+    /*! Source/destination blend factors, kept as NIF's own raw enum values
+     *  (NiAlphaProperty::BlendFunc: 0=ONE, 1=ZERO, 2=SRC_COLOR, ...,
+     *  6=SRC_ALPHA, 7=ONE_MINUS_SRC_ALPHA, ...) rather than translated to a
+     *  render engine's constants. Same principle as the Z-up axis convention:
+     *  the export stays faithful to the source, and a consumer's loader does
+     *  the translation to whatever it renders with. */
+    uint8_t srcBlendMode = 0;
+    uint8_t dstBlendMode = 0;
+    /*! Alpha testing on/off, from flags bit 9. */
+    bool alphaTestEnabled = false;
+    /*! Alpha test comparison function, NIF's raw TestFunc enum (0=ALWAYS,
+     *  1=LESS, ..., 4=GREATER, ...). Measured on the corpus: almost always 4
+     *  (GREATER) when testing is enabled at all. */
+    uint8_t alphaTestFunc = 0;
+    /*! NiAlphaProperty.threshold, 0-255, compared against a pixel's alpha by
+     *  alphaTestFunc. */
+    uint8_t alphaTestThreshold = 0;
+};
+
+/*! Corpus-wide measurements about skinning, accumulated across a run.
+ *
+ *  The influence histogram is the evidence for the truncation policy: the
+ *  format allows 4 influences per vertex, and this says how many vertices the
+ *  source actually pushes past that. */
+struct SkinningStats {
+    int skinnedMeshes = 0;
+    int skeletons = 0;
+    size_t skinnedVertices = 0;
+    /*! influenceHistogram[n] = vertices whose source had exactly n non-zero
+     *  influences. Index 0 means a skinned mesh's vertex that no bone weighted
+     *  at all, which is itself worth reporting. Sized to hold the observed
+     *  maximum; index kMaxTrackedInfluences is an overflow bucket. */
+    static constexpr int kMaxTrackedInfluences = 16;
+    size_t influenceHistogram[kMaxTrackedInfluences + 1] = {};
+    /*! Highest influence count seen on any single vertex. */
+    int maxInfluencesSeen = 0;
+    /*! Vertices whose influences had to be truncated to kInfluencesPerVertex. */
+    size_t verticesTruncated = 0;
+    /*! Total weight discarded by truncation, to show it is negligible. */
+    double weightDiscarded = 0.0;
+    /*! Largest single weight thrown away by truncation. */
+    float maxWeightDiscarded = 0.0f;
+    /*! Vertices with no bone influence at all that a triangle actually draws.
+     *  Unreferenced unweighted vertices are ignored -- nothing renders them. */
+    size_t unweightedVerticesInUse = 0;
+
+    /*! Meshes whose NiSkinData carried no vertex weights (hasVertexWeights = 0)
+     *  and were skinned from NiSkinPartition instead. */
+    int skinsFromPartition = 0;
+
+    /*! Bones that two NiSkinInstances of the same file gave materially
+     *  different inverse bind matrices. A single shared skeleton can only hold
+     *  one, so a non-zero count means the per-skin transform matters. */
+    size_t boneSkinMatrixConflicts = 0;
+    float maxSkinMatrixConflict = 0.0f;
+
+    /*! NiSkinPartition cross-check (see PHASE3_FINDINGS). */
+    int partitionsChecked = 0;
+    int partitionsMissing = 0;
+    size_t partitionVerticesCompared = 0;
+    /*! Influences the partition asserts that NiSkinData does not name at all.
+     *  This is the cross-check that must stay at/near zero: it would mean we
+     *  read the wrong bone. */
+    size_t partitionBoneMissing = 0;
+    /*! Influences the partition names that NiSkinData did have, but that our
+     *  own 4-slot truncation dropped. Expected, not an error. */
+    size_t partitionBoneTruncatedAway = 0;
+    /*! Of partitionBoneMissing, those on a vertex NiSkinData weights not at
+     *  all -- i.e. the partition is the only place the influence exists. */
+    size_t partitionBoneMissingOnUnweighted = 0;
+    /*! Influences whose weight differs by more than 1e-3. Expected to be large
+     *  and benign: a partition caps influences and renormalises, so its weights
+     *  are systematically higher than the unc-apped NiSkinData ones. */
+    size_t partitionWeightMismatches = 0;
+    /*! Of those, the ones where the partition weight is *lower* than ours --
+     *  the direction the subset+renormalise explanation cannot account for. */
+    size_t partitionWeightBelowOurs = 0;
+    /*! Largest such shortfall, to show whether they are rounding or structural. */
+    float maxPartitionBelowDelta = 0.0f;
+    float maxPartitionWeightDelta = 0.0f;
+
+    void Merge(const SkinningStats& o) {
+        skinnedMeshes += o.skinnedMeshes;
+        skeletons += o.skeletons;
+        skinnedVertices += o.skinnedVertices;
+        for (int i = 0; i <= kMaxTrackedInfluences; ++i) {
+            influenceHistogram[i] += o.influenceHistogram[i];
+        }
+        if (o.maxInfluencesSeen > maxInfluencesSeen) maxInfluencesSeen = o.maxInfluencesSeen;
+        verticesTruncated += o.verticesTruncated;
+        weightDiscarded += o.weightDiscarded;
+        if (o.maxWeightDiscarded > maxWeightDiscarded) maxWeightDiscarded = o.maxWeightDiscarded;
+        unweightedVerticesInUse += o.unweightedVerticesInUse;
+        skinsFromPartition += o.skinsFromPartition;
+        boneSkinMatrixConflicts += o.boneSkinMatrixConflicts;
+        if (o.maxSkinMatrixConflict > maxSkinMatrixConflict) {
+            maxSkinMatrixConflict = o.maxSkinMatrixConflict;
+        }
+        partitionsChecked += o.partitionsChecked;
+        partitionsMissing += o.partitionsMissing;
+        partitionVerticesCompared += o.partitionVerticesCompared;
+        partitionBoneMissing += o.partitionBoneMissing;
+        partitionBoneTruncatedAway += o.partitionBoneTruncatedAway;
+        partitionBoneMissingOnUnweighted += o.partitionBoneMissingOnUnweighted;
+        partitionWeightMismatches += o.partitionWeightMismatches;
+        partitionWeightBelowOurs += o.partitionWeightBelowOurs;
+        if (o.maxPartitionBelowDelta > maxPartitionBelowDelta) {
+            maxPartitionBelowDelta = o.maxPartitionBelowDelta;
+        }
+        if (o.maxPartitionWeightDelta > maxPartitionWeightDelta) {
+            maxPartitionWeightDelta = o.maxPartitionWeightDelta;
+        }
+    }
 };
 
 /*! One converted .nif.
  *
- *  Phase 3+ will add skeleton / animations / particleSystems members here. The
- *  writer already emits those JSON keys as empty so the schema does not change
- *  shape later. */
+ *  Phase 4+ will add animations / particleSystems members here. The writer
+ *  already emits those JSON keys as empty so the schema does not change shape
+ *  later. */
 struct SceneData {
     std::string sourceNifPath;
     std::vector<MeshData> meshes;
     std::vector<MaterialData> materials;
+    /*! Typically 0 or 1 per file -- every NiSkinInstance in the corpus shares
+     *  one armature root. Kept as a vector so a file with genuinely separate
+     *  armatures would not need a format change. */
+    std::vector<SkeletonData> skeletons;
 
     /*! Total vertices/triangles across all meshes, for logging. */
     size_t TotalVertices() const {

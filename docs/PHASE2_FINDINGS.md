@@ -317,3 +317,209 @@ cmake --build build --config Release
 build\Release\gfnif-export.exe export input -o out --input-root input
 build\Release\gfnif-export.exe export input -o out --input-root input --verify-strips -v
 ```
+
+---
+
+## 10. Post-hoc fix — alpha / transparency was not extracted
+
+**Found during Phase 3 visual validation, after the helper-geometry fix.**
+Once decorative gizmos were removed (see PHASE3_FINDINGS §12), some models
+still showed **flat, smooth, untextured-looking surfaces** in the viewer —
+but this time `Max helpers dropped: 0` and every texture resolved. These were
+real, correctly-textured geometry (capes, veils, wings, hair, glass, effect
+planes) rendering **opaque** when they should be transparent.
+
+**Cause: `MaterialExtractor` (Phase 2) never read `NiAlphaProperty`.** It
+extracted `NiMaterialProperty`'s colors and its `alpha` (transparency) scalar,
+and `NiTexturingProperty`'s diffuse texture, but the property that actually
+turns blending or alpha-testing *on* — `NiAlphaProperty` — was not among the
+three property types the extractor's loop recognised. `MaterialData.alpha`
+therefore reached the `.gfmodel`, but nothing told a consumer whether to *act*
+on it, so the Phase 2 viewer's own `opacity`/`transparent` logic never
+activated the way GF's source assets intend.
+
+### Measuring before implementing
+
+**1. How common is `NiAlphaProperty`, and how much of it is real transparency?**
+
+```
+total shapes (NiTriShape/NiTriStrips) = 41 783
+  with NiMaterialProperty              = 41 783  (100% -- every shape has one)
+  with NiAlphaProperty                 = 31 822  (76.1%)
+files containing >= 1 NiAlphaProperty  = 2 453 / 2 825  (86.8%)
+
+NiMaterialProperty.alpha distribution (41 783 materials):
+  < 1.0 (semi-transparent at the material level) = 23 692  (56.7%)
+  == 1.0 (opaque)                                = 18 091  (43.3%)
+  range observed                                 = [-3.60736, 10]  (see below)
+```
+
+`NiAlphaProperty` was already confirmed present in Phase 1's 56-block-type
+survey (`NiAlphaProperty` — 29 occurrences in the 17-file sample). At full
+corpus scale it turns out to be one of the **most common** property types:
+present on more than 3 of every 4 shapes, and on 87% of files.
+
+**A genuine data anomaly, investigated rather than silently worked around:**
+228 materials (0.5%) have an out-of-range `alpha` — 227 small negatives (down
+to -0.88) and one value of 10. Checking each one: **all 228 occur on a shape
+that also carries a `NiAlphaProperty` with blending enabled.** The scalar is
+malformed legacy/authoring data on those shapes specifically, not something to
+chase further — the shape's actual transparency is controlled by the
+`NiAlphaProperty` blend state, and the bogus `NiMaterialProperty.alpha` is
+effectively vestigial there. The extractor now clamps it to `[0, 1]` on read
+so a consumer reading the field in isolation never sees a negative opacity;
+the `NiAlphaProperty` fields are unaffected and remain the authoritative
+signal for whether a material blends.
+
+**2. Flag bitfield, decoded against niflib's own generated accessors (which
+niflib in turn generates from `nifxml`, the canonical format reference this
+project has used throughout):**
+
+```cpp
+// external/niflib/include/obj/NiAlphaProperty.h -- comment above `flags`:
+// Bit 0        : alpha blending enable
+// Bits 1-4     : source blend mode   )  OpenGL glBlendFunc semantics
+// Bits 5-8     : destination blend mode )
+// Bit 9        : alpha test enable
+// Bits 10-12   : alpha test mode        (OpenGL glAlphaFunc semantics)
+// Bit 13       : no-sorter flag (disables triangle sorting)
+```
+
+niflib exposes this pre-decoded (`GetBlendState`, `GetSourceBlendFunc`,
+`GetDestBlendFunc`, `GetTestState`, `GetTestFunc`, `GetTriangleSortMode`), so
+the extractor uses those typed accessors directly rather than hand-rolling bit
+masks — the risk of an off-by-one in a hand-decoded bitfield is exactly the
+kind of bug this measure-first approach exists to avoid.
+
+**Combinations actually seen in the corpus: 44 distinct per-shape (measured
+before material de-duplication), collapsing to 12 distinct
+`(blend, src, dst, test, testFunc)` tuples across the 14 756 de-duplicated
+materials that carry a `NiAlphaProperty`** — out of a 16-bit field that could
+in principle encode thousands. As the brief expected, real usage clusters
+tightly onto two shapes:
+
+| blend | src | dst | test | func | materials | meaning |
+|---|---|---|---|---|---:|---|
+| on | `SRC_ALPHA` (6) | `ONE` (0) | off | — | 9 367 | additive (glow/particle-style) |
+| off | `SRC_ALPHA` (6) | `ONE_MINUS_SRC_ALPHA` (7) | on | `GREATER` (4) | 2 245 | alpha-tested cutout, no blend |
+| on | `SRC_ALPHA` (6) | `ONE` (0) | off | — | 1 794 | additive, threshold unused |
+| on | `SRC_ALPHA` (6) | `ONE_MINUS_SRC_ALPHA` (7) | off | — | 1 067 | standard "over" alpha blend |
+| on | `SRC_ALPHA` (6) | `ONE_MINUS_SRC_ALPHA` (7) | on | `GREATER` (4) | 130 | blend + test together |
+| *(6 further combos)* | | | | | 153 | one blend/test/threshold variant each |
+
+`srcBlendMode` is `SRC_ALPHA` (6) in **every single** blend-enabled material
+in the corpus — no other source factor occurs anywhere. `alphaTestFunc` is
+`GREATER` (4) whenever testing is enabled at all, `ALWAYS` (0) (i.e.
+unused) otherwise; total blend-enabled materials: 12 498 (`dst=ONE` additive:
+11 181; `dst=ONE_MINUS_SRC_ALPHA` standard blend: 1 316; one `dst=8` outlier).
+This is exactly the "very few distinct combinations" the brief predicted, and
+none of it is exotic: it is the standard OpenGL-style alpha blend / additive /
+alpha-cutout trio GF's Gamebryo-era pipeline would be expected to use.
+
+**3. PNG alpha channel — confirmed intact, ruling out an upstream problem.**
+Sampled 280 PNGs across all 7 texture-bearing entity types (`char/` ships no
+`texture/`, per Phase 1 §4):
+
+```
+mode: 100% RGBA (0 non-RGBA, 0 missing an alpha channel entirely)
+alpha channel carries real (non-uniform) data: 221 / 280  (78.9%)
+alpha channel present but fully opaque (255 everywhere):   59 / 280  (21.1%)
+```
+
+The DDS→PNG conversion upstream of this project preserved the alpha channel
+correctly on every sample, including `effect/` textures specifically (5/5
+sampled show a full 0–255 alpha range). **The problem was entirely in the
+exporter, not the source assets** — exactly what the measurement in step 4 of
+the brief was meant to rule in or out.
+
+### Extending `MaterialData`
+
+```cpp
+struct MaterialData {
+    // ... Phase 2 fields unchanged (diffuseTexturePath, ambient, diffuse,
+    //     specular, emissive, glossiness, hasVertexColor, textureFound) ...
+
+    float alpha = 1.0f;              // NiMaterialProperty transparency, clamped [0,1]
+
+    bool    hasAlphaProperty = false;  // false => opaque, exactly Phase 2's behaviour
+    bool    alphaBlendEnabled = false;
+    uint8_t srcBlendMode = 0;          // NiAlphaProperty::BlendFunc, raw NIF value
+    uint8_t dstBlendMode = 0;
+    bool    alphaTestEnabled = false;
+    uint8_t alphaTestFunc = 0;         // NiAlphaProperty::TestFunc, raw NIF value
+    uint8_t alphaTestThreshold = 0;    // 0-255
+};
+```
+
+Blend and test modes are stored as **NIF's own raw enum values**, not
+translated to a render engine's constants — the same principle already
+applied to the Z-up axis convention (PHASE2_FINDINGS §6, §9): the export
+format stays faithful to the source, and translation to whatever a consumer
+actually renders with happens in that consumer's loader, not in the exporter.
+
+`hasAlphaProperty = false` (no `NiAlphaProperty` attached) leaves every other
+field at its default and is the exact Phase 2 behaviour — no regression for
+the 13.2% of files that carry none.
+
+### Viewer
+
+`tools/viewer/index.html` maps the exported fields onto
+`THREE.MeshStandardMaterial`:
+
+* `opacity` = `alpha`; `transparent = true` and **`depthWrite = false`** the
+  moment either `alphaBlendEnabled` or `alpha < 1`. This is the specific fix
+  for the reported symptom: a blended surface that still writes depth hides
+  everything behind it exactly like an opaque one, which is indistinguishable
+  from the "flat parasitic surface" the fix was chasing.
+* `alphaTest = alphaTestThreshold / 255` when `alphaTestEnabled`, and
+  `depthWrite` stays **`true`** for a test-only material (no blend) — cutout
+  geometry (foliage, hair cards) discards pixels outright, so what remains is
+  genuinely opaque and should still occlude correctly. Getting this backwards
+  would have been a different, subtler bug than the one being fixed.
+* Texture loading was already alpha-correct: `THREE.TextureLoader` decodes a
+  PNG's alpha channel natively, and nothing in the viewer forces an RGB-only
+  format.
+* Known limitation, not addressed here: Three.js sorts transparent objects by
+  distance but does not sort *within* one mesh's own triangles, so
+  self-overlapping transparent geometry (e.g. a cape's front and back faces)
+  can still show ordering artifacts. This is a general transparency-rendering
+  limitation, not an export defect, and is left as-is per the brief.
+
+### Validation
+
+* **Simulated the viewer's exact material logic in Python** against 400
+  random exported materials (same technique as the Phase 3 bind-pose check):
+  **0 violations** of "blend ⇒ depthWrite=false" (1473 cases) or "test-only ⇒
+  depthWrite=true" (309 cases), and opaque/no-property materials correctly
+  produce no special flags at all (497 cases).
+* **Format validation**: 500 random models checked for the new fields being
+  present, `alpha` in `[0,1]`, and `hasAlphaProperty = false` materials having
+  every dependent field at its default. **0 issues.**
+* **Generality, not a single-file fix**: blend-enabled materials appear in
+  **all 8 entity types**, concentrated exactly where expected —
+  `effect/` 2/2 files (100%), `item/` 762/1222 (62%, capes/cloth/glass),
+  `ride/` 327/420 (78%), `chair/` 81/111 (73%, the Phase 2 "cocktail glass"
+  file `C001` among them, now carrying real 0.5/0.7/0.8 opacity values rather
+  than the flat opaque the old extractor produced), `npc/` 81/362.
+* **Non-regression, corpus totals**: re-ran the full export.
+  `Vertices: 5 883 591`, `Triangles: 7 131 151`, `Max helpers dropped: 8389` —
+  **identical to the post-helper-filter Phase 3 numbers** (this fix touches
+  `MaterialExtractor` only; no geometry is added, removed, or moved). The
+  `GFNIF_VERIFYSKIN` ground-truth check is likewise unchanged: 6603 verified,
+  same 5 known exceptions as Phase 3 §3/§11 — skinning does not read
+  materials, so it cannot have been affected, and re-running it confirms that.
+* No headless browser was available in this environment (same constraint
+  noted in PHASE3_FINDINGS §11), so the "confirm in the viewer" step could not
+  be captured as a screenshot. The Python simulation above replicates the
+  viewer's material-construction logic line-for-line against the real
+  exported JSON, which is the same substitute used for the Phase 3 bind-pose
+  proof; a manual check in a browser is still recommended before sign-off.
+
+### Carried forward
+
+Nothing here changes the Phase 3 skeleton/skinning path — materials and
+skinning are extracted independently, and the numbers above confirm neither
+geometry nor skinning moved. `NiTexturingProperty` alpha maps / multi-texture
+blending (a texture's *own* alpha channel driving a separate blend mode, as
+opposed to the material-level `NiAlphaProperty` this fix covers) was not
+investigated and is out of scope here, same as the brief's boundary.

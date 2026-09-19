@@ -28,6 +28,13 @@ size_t AppendUint32(std::string& buffer, const std::vector<uint32_t>& values) {
     return offset;
 }
 
+size_t AppendUint16(std::string& buffer, const std::vector<uint16_t>& values) {
+    const size_t offset = buffer.size();
+    buffer.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(uint16_t));
+    return offset;
+}
+
+
 /*! Escapes a string for JSON. Texture paths and mesh names come from game data,
  *  so backslashes and stray control characters are both possible. */
 std::string JsonEscape(const std::string& s) {
@@ -64,6 +71,18 @@ std::string Vec3Json(const float (&v)[3]) {
     return "[" + Num(v[0]) + ", " + Num(v[1]) + ", " + Num(v[2]) + "]";
 }
 
+/*! Serialises a column-major 4x4 as a flat JSON array, in the element order
+ *  THREE.Matrix4.fromArray expects. */
+std::string Mat4Json(const float (&m)[16]) {
+    std::ostringstream out;
+    out << "[";
+    for (int i = 0; i < 16; ++i) {
+        out << (i ? ", " : "") << Num(m[i]);
+    }
+    out << "]";
+    return out.str();
+}
+
 } // namespace
 
 bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::string& error) {
@@ -84,6 +103,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::string bin;
     struct MeshRanges {
         size_t position = 0, normal = 0, uv = 0, color = 0, index = 0;
+        size_t skinIndex = 0, skinWeight = 0;
     };
     std::vector<MeshRanges> ranges;
     ranges.reserve(scene.meshes.size());
@@ -117,6 +137,43 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         }
         r.color = AppendFloats(bin, scratch.data(), scratch.size());
 
+        // Skin attributes are written only for a skinned mesh, so an unskinned
+        // one costs nothing in the .gfbin even though every Vertex carries the
+        // slots in memory. uint16 bone indices match THREE's skinIndex
+        // expectations and halve the space against uint32.
+        if (mesh.isSkinned) {
+            std::vector<uint16_t> boneIdx;
+            boneIdx.reserve(mesh.vertices.size() * kInfluencesPerVertex);
+            for (const Vertex& v : mesh.vertices) {
+                for (int k = 0; k < kInfluencesPerVertex; ++k) {
+                    boneIdx.push_back(v.boneIndex[k]);
+                }
+            }
+            r.skinIndex = AppendUint16(bin, boneIdx);
+
+            // uint16 leaves the buffer 2-byte aligned on an odd vertex count;
+            // pad so the float32 weights that follow start 4-byte aligned, as
+            // a Float32Array view over the range requires.
+            while (bin.size() % 4 != 0) {
+                bin.push_back('\0');
+            }
+
+            scratch.clear();
+            scratch.reserve(mesh.vertices.size() * kInfluencesPerVertex);
+            for (const Vertex& v : mesh.vertices) {
+                for (int k = 0; k < kInfluencesPerVertex; ++k) {
+                    scratch.push_back(v.weight[k]);
+                }
+            }
+            r.skinWeight = AppendFloats(bin, scratch.data(), scratch.size());
+        }
+
+        // Uint32Array views need 4-byte alignment too. Everything above ends on
+        // a 4-byte boundary already, but the padding is kept explicit so a
+        // future attribute of another width cannot silently break it.
+        while (bin.size() % 4 != 0) {
+            bin.push_back('\0');
+        }
         r.index = AppendUint32(bin, mesh.indices);
         ranges.push_back(r);
     }
@@ -138,7 +195,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::ostringstream js;
     js << "{\n";
     js << "  \"formatVersion\": " << kGfModelFormatVersion << ",\n";
-    js << "  \"generator\": \"gfnif-export (phase 2)\",\n";
+    js << "  \"generator\": \"gfnif-export (phase 3)\",\n";
     js << "  \"sourceNif\": \"" << JsonEscape(scene.sourceNifPath) << "\",\n";
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
@@ -157,6 +214,21 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "      \"sourceTopology\": \""
            << (m.source == MeshData::Source::TriStrips ? "NiTriStrips" : "NiTriShape") << "\",\n";
         js << "      \"degenerateTrianglesDropped\": " << m.degenerateTrianglesDropped << ",\n";
+        js << "      \"isSkinned\": " << (m.isSkinned ? "true" : "false") << ",\n";
+        js << "      \"skeletonIndex\": " << m.skeletonIndex << ",\n";
+        // glTF "joints" + "inverseBindMatrices", folded into one list: entry j
+        // is the bone that this mesh's skinIndex value j refers to, with the
+        // inverse bind matrix *this* skin supplies for it.
+        if (m.isSkinned) {
+            js << "      \"skinBindings\": [\n";
+            for (size_t b = 0; b < m.skinBindings.size(); ++b) {
+                const SkinBinding& sb = m.skinBindings[b];
+                js << "        {\"bone\": " << sb.boneIndex << ", \"skinMatrix\": "
+                   << Mat4Json(sb.skinMatrix) << "}"
+                   << (b + 1 < m.skinBindings.size() ? "," : "") << "\n";
+            }
+            js << "      ],\n";
+        }
         // Each accessor is {byteOffset, componentCount, count, type}, enough to
         // build a THREE.BufferAttribute with no further arithmetic.
         js << "      \"attributes\": {\n";
@@ -167,7 +239,21 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "        \"uv\": {\"byteOffset\": " << r.uv << ", \"itemSize\": 2, \"count\": "
            << vcount << ", \"type\": \"float32\"},\n";
         js << "        \"color\": {\"byteOffset\": " << r.color
-           << ", \"itemSize\": 4, \"count\": " << vcount << ", \"type\": \"float32\"}\n";
+           << ", \"itemSize\": 4, \"count\": " << vcount << ", \"type\": \"float32\"}";
+        // Present only on a skinned mesh. The names match THREE's
+        // 'skinIndex'/'skinWeight' buffer attributes, so a consumer can set
+        // them straight onto a SkinnedMesh geometry.
+        if (m.isSkinned) {
+            js << ",\n";
+            js << "        \"skinIndex\": {\"byteOffset\": " << r.skinIndex << ", \"itemSize\": "
+               << kInfluencesPerVertex << ", \"count\": " << vcount
+               << ", \"type\": \"uint16\"},\n";
+            js << "        \"skinWeight\": {\"byteOffset\": " << r.skinWeight << ", \"itemSize\": "
+               << kInfluencesPerVertex << ", \"count\": " << vcount
+               << ", \"type\": \"float32\"}\n";
+        } else {
+            js << "\n";
+        }
         js << "      },\n";
         js << "      \"indices\": {\"byteOffset\": " << r.index << ", \"count\": "
            << m.indices.size() << ", \"type\": \"uint32\"}\n";
@@ -188,15 +274,48 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "      \"specular\": " << Vec3Json(m.specular) << ",\n";
         js << "      \"emissive\": " << Vec3Json(m.emissive) << ",\n";
         js << "      \"glossiness\": " << Num(m.glossiness) << ",\n";
-        js << "      \"alpha\": " << Num(m.alpha) << "\n";
+        js << "      \"alpha\": " << Num(m.alpha) << ",\n";
+        // Raw NIF NiAlphaProperty state -- see MaterialData::srcBlendMode for
+        // why these stay as NIF's own enum values rather than a render
+        // engine's constants. hasAlphaProperty=false means every other field
+        // here is meaningless and the material is plain opaque, matching
+        // Phase 2's behaviour exactly.
+        js << "      \"hasAlphaProperty\": " << (m.hasAlphaProperty ? "true" : "false") << ",\n";
+        js << "      \"alphaBlendEnabled\": " << (m.alphaBlendEnabled ? "true" : "false") << ",\n";
+        js << "      \"srcBlendMode\": " << static_cast<int>(m.srcBlendMode) << ",\n";
+        js << "      \"dstBlendMode\": " << static_cast<int>(m.dstBlendMode) << ",\n";
+        js << "      \"alphaTestEnabled\": " << (m.alphaTestEnabled ? "true" : "false") << ",\n";
+        js << "      \"alphaTestFunc\": " << static_cast<int>(m.alphaTestFunc) << ",\n";
+        js << "      \"alphaTestThreshold\": " << static_cast<int>(m.alphaTestThreshold) << "\n";
         js << "    }" << (i + 1 < scene.materials.size() ? "," : "") << "\n";
+    }
+    js << "  ],\n";
+
+    // Bones are emitted parent-before-child, so a consumer can build the
+    // hierarchy in one forward pass without sorting or deferring.
+    js << "  \"skeletons\": [\n";
+    for (size_t i = 0; i < scene.skeletons.size(); ++i) {
+        const SkeletonData& s = scene.skeletons[i];
+        js << "    {\n";
+        js << "      \"rootName\": \"" << JsonEscape(s.rootName) << "\",\n";
+        js << "      \"boneCount\": " << s.bones.size() << ",\n";
+        js << "      \"bones\": [\n";
+        for (size_t b = 0; b < s.bones.size(); ++b) {
+            const BoneData& bone = s.bones[b];
+            js << "        {\"name\": \"" << JsonEscape(bone.name) << "\""
+               << ", \"parent\": " << bone.parentIndex
+               << ", \"isAttachPoint\": " << (bone.isAttachPoint ? "true" : "false")
+               << ",\n         \"bindMatrixLocal\": " << Mat4Json(bone.bindMatrixLocal) << "}"
+               << (b + 1 < s.bones.size() ? "," : "") << "\n";
+        }
+        js << "      ]\n";
+        js << "    }" << (i + 1 < scene.skeletons.size() ? "," : "") << "\n";
     }
     js << "  ],\n";
 
     // Reserved for later phases. Emitted as empty rather than omitted so the
     // schema keeps its shape, but deliberately NOT pre-filled with a guessed
-    // structure -- phases 3 to 5 will define these.
-    js << "  \"skeleton\": null,\n";
+    // structure -- phases 4 and 5 will define these.
     js << "  \"animations\": [],\n";
     js << "  \"particleSystems\": []\n";
     js << "}\n";

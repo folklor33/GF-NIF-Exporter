@@ -80,7 +80,9 @@ add_executable(gfnif-export
     src/nif/HeaderNormalizer.cpp
     src/nif/MaterialExtractor.cpp
     src/nif/MeshExtractor.cpp
+    src/nif/NameClassifier.cpp
     src/nif/NifDumper.cpp
+    src/nif/SkeletonExtractor.cpp
     src/texture/TextureResolver.cpp
 )
 target_include_directories(gfnif-export PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

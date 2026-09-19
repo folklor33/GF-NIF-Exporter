@@ -21,8 +21,21 @@ struct ExtractionResult {
     /*! Geometry blocks skipped because their data block was missing or their
      *  topology was not understood. */
     int geometriesSkipped = 0;
+    /*! Geometry blocks dropped as 3ds Max editor helpers (bone gizmos, biped
+     *  boxes, attachment nubs). Not errors -- see NameClassifier.hpp. */
+    int helperGeometriesDropped = 0;
+    /*! Geometry blocks dropped because NiAVObject::GetVisibility() was false
+     *  -- the source file's own hidden flag. Not errors. */
+    int hiddenGeometriesDropped = 0;
     /*! Deepest node nesting reached while walking, for diagnostics. */
     int maxDepthSeen = 0;
+
+    /*! Skinning measurements for this file, merged into a corpus total by the
+     *  caller. */
+    SkinningStats skinning;
+    /*! Geometries that carried a NiSkinInstance we could not use and were
+     *  therefore exported as static meshes instead. */
+    int skinsFailed = 0;
 };
 
 /*! Depth past which the node walk gives up on a subtree rather than risking the

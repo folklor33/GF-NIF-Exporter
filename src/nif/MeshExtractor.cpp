@@ -2,6 +2,8 @@
 
 #include "nif/HeaderNormalizer.hpp"
 #include "nif/MaterialExtractor.hpp"
+#include "nif/NameClassifier.hpp"
+#include "nif/SkeletonExtractor.hpp"
 #include "texture/TextureResolver.hpp"
 
 #include "niflib.h"
@@ -11,6 +13,7 @@
 #include "obj/NiGeometryData.h"
 #include "obj/NiNode.h"
 #include "obj/NiObject.h"
+#include "obj/NiSkinInstance.h"
 #include "obj/NiTriShape.h"
 #include "obj/NiTriShapeData.h"
 #include "obj/NiTriStrips.h"
@@ -160,6 +163,7 @@ void WalkNode(Niflib::NiAVObject* obj,
               const Matrix44& parentWorld,
               SceneData& scene,
               MaterialExtractor& materials,
+              SkeletonExtractor& skeletons,
               std::set<NiObject*>& visited,
               ExtractionResult& result,
               int depth,
@@ -184,8 +188,8 @@ void WalkNode(Niflib::NiAVObject* obj,
 
     if (auto* node = dynamic_cast<Niflib::NiNode*>(obj)) {
         for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
-            WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, visited,
-                     result, depth + 1, verifyStrips);
+            WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, skeletons,
+                     visited, result, depth + 1, verifyStrips);
         }
         return;
     }
@@ -194,6 +198,22 @@ void WalkNode(Niflib::NiAVObject* obj,
     auto* triStrips = dynamic_cast<Niflib::NiTriStrips*>(obj);
     if (triShape == nullptr && triStrips == nullptr) {
         return; // Not geometry (a particle system, a camera, ...). Not our phase.
+    }
+
+    // NiAVObject::flags bit 0 is the file's own, authoritative visibility
+    // flag -- the artist/pipeline explicitly marked this shape not to be
+    // rendered, as opposed to the name/texture heuristics used elsewhere in
+    // this file. Measured on the full corpus: 10 160 shapes (24.3%) are
+    // hidden this way, 590 447 vertices, across 900 files (31.9%); 90.5% of
+    // them are untextured leftovers (matching the pattern found on M491),
+    // but 461 are large (>100 verts) and textured -- consistent with
+    // deliberately-hidden LOD/variant geometry kept in the file rather than
+    // deleted. There is no case for exporting what the source file itself
+    // says not to draw, so this is unconditional: no texture/name gate
+    // needed, unlike NameClassifier's filter. See PHASE3_FINDINGS §13.
+    if (!obj->GetVisibility()) {
+        ++result.hiddenGeometriesDropped;
+        return;
     }
 
     auto* geom = static_cast<Niflib::NiGeometry*>(obj);
@@ -207,6 +227,20 @@ void WalkNode(Niflib::NiAVObject* obj,
     MeshData mesh;
     mesh.name = obj->GetName();
     mesh.materialIndex = materials.ExtractFor(obj, scene.materials);
+
+    // Drop the 3ds Max helper gizmos the exporter left in the file: bone
+    // octahedra, biped boxes, attachment nubs. They are real NiTriShapes, so
+    // nothing upstream filters them, and they render as blank grey surfaces.
+    //
+    // The material has to be resolved first, because the test is name AND
+    // untextured -- a name match alone would take out real geometry that
+    // happens to still be called "Box02". See NameClassifier.hpp.
+    const bool hasResolvedTexture = mesh.materialIndex >= 0 &&
+                                    scene.materials[mesh.materialIndex].textureFound;
+    if (ShouldDropGeometry(mesh.name, hasResolvedTexture)) {
+        ++result.helperGeometriesDropped;
+        return;
+    }
 
     const bool hasVertexColor = mesh.materialIndex >= 0 &&
                                 scene.materials[mesh.materialIndex].hasVertexColor;
@@ -274,7 +308,29 @@ void WalkNode(Niflib::NiAVObject* obj,
         }
     }
 
-    BuildVertices(data, world, hasVertexColor, mesh.vertices);
+    // Skinned vertices stay raw, in the shape's own local space; unskinned
+    // geometry keeps the Phase 2 world-space flattening.
+    //
+    // This matches niflib's own NiGeometry::GetSkinDeformation, which feeds the
+    // untransformed NiGeometryData vertices through `boneOffset * boneWorld`.
+    // The bone chain therefore carries the placement, and baking the node's
+    // world matrix in here as well would apply it twice.
+    //
+    // PHASE2_FINDINGS §9.3 established that NiTriStrips is never skinned across
+    // the whole corpus, so only the NiTriShape path needs to ask.
+    const bool wantsSkin = triShape != nullptr && triShape->GetSkinInstance() != NULL;
+    BuildVertices(data, wantsSkin ? Matrix44::IDENTITY : world, hasVertexColor, mesh.vertices);
+
+    if (wantsSkin) {
+        // A skin that cannot be resolved falls back to a static export rather
+        // than dropping the geometry: a visible mesh in the wrong pose beats a
+        // hole, and the warning says which it was. The vertices have to be
+        // rebuilt in world space for that, since they were left local above.
+        if (!skeletons.ApplySkin(triShape, scene, mesh, result.skinning)) {
+            BuildVertices(data, world, hasVertexColor, mesh.vertices);
+            ++result.skinsFailed;
+        }
+    }
 
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         result.warnings.push_back("geometry '" + mesh.name + "' produced no triangles; skipped");
@@ -350,6 +406,9 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
 
     TextureResolver resolver(nifPath);
     MaterialExtractor materials(resolver, &result.warnings);
+    // One extractor per file, so every skinned shape shares the single
+    // skeleton it builds rather than duplicating it per sub-mesh.
+    SkeletonExtractor skeletons(&result.warnings);
 
     // Roots are the blocks nothing else references. Starting from every root
     // (rather than assuming block 0) keeps files with several top-level nodes
@@ -370,12 +429,26 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
             continue;
         }
         if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
-            WalkNode(av, Matrix44::IDENTITY, scene, materials, visited, result, 0, verifyStrips);
+            WalkNode(av, Matrix44::IDENTITY, scene, materials, skeletons, visited, result, 0,
+                     verifyStrips);
         }
     }
 
+    result.skinning.skeletons = static_cast<int>(scene.skeletons.size());
+
     if (scene.meshes.empty()) {
-        result.error = "no geometry found (" + std::to_string(blocks.size()) + " blocks parsed)";
+        // Distinguish "every shape was explicitly hidden by the source file"
+        // from a genuinely empty/malformed file: the former is a real
+        // statement about the asset (an unused or trigger-only NPC, for
+        // instance -- confirmed on npc/N600.nif, whose 4 shapes are all
+        // hidden), not an extraction defect, and should read that way in the
+        // summary rather than looking like every other parse failure.
+        if (result.hiddenGeometriesDropped > 0) {
+            result.error = "no visible geometry (" + std::to_string(result.hiddenGeometriesDropped) +
+                           " shape(s) present but all marked hidden in the source file)";
+        } else {
+            result.error = "no geometry found (" + std::to_string(blocks.size()) + " blocks parsed)";
+        }
         return result;
     }
 

@@ -1,12 +1,14 @@
 #include "nif/MaterialExtractor.hpp"
 
 #include "obj/NiAVObject.h"
+#include "obj/NiAlphaProperty.h"
 #include "obj/NiMaterialProperty.h"
 #include "obj/NiProperty.h"
 #include "obj/NiSourceTexture.h"
 #include "obj/NiTexturingProperty.h"
 #include "obj/NiVertexColorProperty.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -36,7 +38,10 @@ bool SameMaterial(const MaterialData& a, const MaterialData& b) {
            a.textureFound == b.textureFound && SameColor(a.ambient, b.ambient) &&
            SameColor(a.diffuse, b.diffuse) && SameColor(a.specular, b.specular) &&
            SameColor(a.emissive, b.emissive) && NearlyEqual(a.glossiness, b.glossiness) &&
-           NearlyEqual(a.alpha, b.alpha);
+           NearlyEqual(a.alpha, b.alpha) && a.hasAlphaProperty == b.hasAlphaProperty &&
+           a.alphaBlendEnabled == b.alphaBlendEnabled && a.srcBlendMode == b.srcBlendMode &&
+           a.dstBlendMode == b.dstBlendMode && a.alphaTestEnabled == b.alphaTestEnabled &&
+           a.alphaTestFunc == b.alphaTestFunc && a.alphaTestThreshold == b.alphaTestThreshold;
 }
 
 } // namespace
@@ -70,8 +75,18 @@ int MaterialExtractor::ExtractFor(Niflib::NiAVObject* geometry,
             CopyColor3(matProp->GetEmissiveColor(), mat.emissive);
             mat.glossiness = matProp->GetGlossiness();
             // niflib exposes this as "transparency"; in the NIF it is an alpha
-            // value where 1.0 means fully opaque.
-            mat.alpha = matProp->GetTransparency();
+            // value where 1.0 means fully opaque. Clamped: see MaterialData::alpha.
+            mat.alpha = std::clamp(matProp->GetTransparency(), 0.0f, 1.0f);
+            any = true;
+        } else if (auto* alphaProp = dynamic_cast<Niflib::NiAlphaProperty*>(
+                       static_cast<Niflib::NiProperty*>(prop))) {
+            mat.hasAlphaProperty = true;
+            mat.alphaBlendEnabled = alphaProp->GetBlendState();
+            mat.srcBlendMode = static_cast<uint8_t>(alphaProp->GetSourceBlendFunc());
+            mat.dstBlendMode = static_cast<uint8_t>(alphaProp->GetDestBlendFunc());
+            mat.alphaTestEnabled = alphaProp->GetTestState();
+            mat.alphaTestFunc = static_cast<uint8_t>(alphaProp->GetTestFunc());
+            mat.alphaTestThreshold = alphaProp->GetTestThreshold();
             any = true;
         } else if (auto* texProp = dynamic_cast<Niflib::NiTexturingProperty*>(
                        static_cast<Niflib::NiProperty*>(prop))) {

@@ -45,6 +45,8 @@
   <label><input type="checkbox" id="tex" checked> textures</label>
   <label><input type="checkbox" id="vcol" checked> vertex colors</label>
   <label><input type="checkbox" id="zup" checked> Z-up &rarr; Y-up</label>
+  <label><input type="checkbox" id="skel"> skeleton</label>
+  <label><input type="checkbox" id="skin" checked> skinning</label>
 </div>
 <div id="stats">no model loaded</div>
 
@@ -115,13 +117,54 @@ function attr(buffer, acc) {
   return new THREE.BufferAttribute(a, acc.itemSize);
 }
 
+// uint16 skinIndex accessor. Kept separate from attr() because THREE wants an
+// integer attribute here, not a float one.
+function attrU16(buffer, acc) {
+  if (!acc || acc.count === 0) return null;
+  const a = new Uint16Array(buffer, acc.byteOffset, acc.count * acc.itemSize);
+  return new THREE.BufferAttribute(a, acc.itemSize);
+}
+
+// Rebuilds one skeleton's bones as a THREE.Bone hierarchy.
+//
+// bindMatrixLocal is each bone's rest transform in its parent's space, already
+// column-major, so it is decomposed straight onto the Bone. Bones come out of
+// the exporter parent-before-child, so a single forward pass suffices.
+function buildBones(skel) {
+  const bones = skel.bones.map(b => {
+    const bone = new THREE.Bone();
+    bone.name = b.name;
+    new THREE.Matrix4().fromArray(b.bindMatrixLocal)
+      .decompose(bone.position, bone.quaternion, bone.scale);
+    return bone;
+  });
+  const roots = [];
+  skel.bones.forEach((b, i) => {
+    if (b.parent < 0) roots.push(bones[i]);
+    else bones[b.parent].add(bones[i]);
+  });
+  return { bones, roots };
+}
+
 function buildScene(model, bin, textureUrlFor) {
   const group = new THREE.Group();
   const showTex = document.getElementById('tex').checked;
   const showVcol = document.getElementById('vcol').checked;
   const wire = document.getElementById('wire').checked;
+  const showSkel = document.getElementById('skel').checked;
+  const useSkin = document.getElementById('skin').checked;
   const loader = new THREE.TextureLoader();
   const notes = [];
+
+  // One THREE bone hierarchy per exported skeleton, shared by every skinned
+  // mesh that references it -- mirroring the exporter's own "one skeleton per
+  // file" rule rather than rebuilding it per sub-mesh.
+  const skeletons = (model.skeletons || []).map(s => {
+    const { bones, roots } = buildBones(s);
+    roots.forEach(r => group.add(r));
+    roots.forEach(r => r.updateMatrixWorld(true));
+    return { bones, roots, def: s };
+  });
 
   for (const m of model.meshes) {
     const g = new THREE.BufferGeometry();
@@ -139,6 +182,16 @@ function buildScene(model, bin, textureUrlFor) {
       if (c) g.setAttribute('color', c);
     }
 
+    const skinned = useSkin && m.isSkinned && skeletons[m.skeletonIndex];
+    if (skinned) {
+      const si = attrU16(bin, m.attributes.skinIndex);
+      const sw = attr(bin, m.attributes.skinWeight);
+      if (si && sw) {
+        g.setAttribute('skinIndex', si);
+        g.setAttribute('skinWeight', sw);
+      }
+    }
+
     const idx = new Uint32Array(bin, m.indices.byteOffset, m.indices.count);
     g.setIndex(new THREE.BufferAttribute(idx, 1));
     if (!n) g.computeVertexNormals();
@@ -152,9 +205,29 @@ function buildScene(model, bin, textureUrlFor) {
       roughness: 0.85,
     };
     if (mat.diffuse) params.color = new THREE.Color(...mat.diffuse);
-    if (mat.alpha !== undefined && mat.alpha < 1) {
+
+    // NiAlphaProperty -> THREE.MeshStandardMaterial.
+    //
+    // Blend and test are genuinely different things and need different
+    // depthWrite: blending needs depthWrite:false or a transparent surface
+    // wrongly occludes whatever is behind it (writes to the depth buffer as
+    // if it were opaque) -- this is exactly the "parasitic opaque plate"
+    // symptom that motivated this fix. Alpha testing instead discards pixels
+    // outright before shading, so what's left really is opaque and keeping
+    // depthWrite:true is correct (and desirable -- cutout foliage/hair still
+    // wants to occlude what's behind the kept pixels).
+    const blend = !!mat.alphaBlendEnabled;
+    const test = !!mat.alphaTestEnabled;
+    params.opacity = mat.alpha !== undefined ? mat.alpha : 1;
+    if (blend || params.opacity < 1) {
       params.transparent = true;
-      params.opacity = mat.alpha;
+      params.depthWrite = false;
+    }
+    if (test) {
+      params.alphaTest = (mat.alphaTestThreshold ?? 0) / 255;
+      // Alpha test on its own does not need `transparent`, and if blending is
+      // also on, depthWrite stays false from the branch above.
+      if (!blend) params.depthWrite = true;
     }
 
     const material = new THREE.MeshStandardMaterial(params);
@@ -175,7 +248,41 @@ function buildScene(model, bin, textureUrlFor) {
       notes.push(`<span class="warn">unresolved texture: ${mat.sourceTextureName}</span>`);
     }
 
-    group.add(new THREE.Mesh(g, material));
+    if (skinned) {
+      const sk = skeletons[m.skeletonIndex];
+      // skinIndex values index this mesh's OWN binding list (glTF "joints"),
+      // so the THREE.Skeleton is built from exactly those bones, in that order.
+      const meshBones = m.skinBindings.map(b => sk.bones[b.bone]);
+      // The exporter stores the complete bind-pose skin matrix per binding.
+      // THREE wants boneInverses such that boneMatrix * boneInverse reproduces
+      // it, and since it multiplies by the bone's current world matrix, the
+      // inverse is that world matrix undone from the stored product.
+      const boneInverses = m.skinBindings.map((b, i) => {
+        const skinM = new THREE.Matrix4().fromArray(b.skinMatrix);
+        const bw = meshBones[i].matrixWorld.clone();
+        return bw.invert().multiply(skinM);
+      });
+      material.skinning = true;
+      const sm = new THREE.SkinnedMesh(g, material);
+      // The bind matrix must be identity: exported skinned positions are raw
+      // shape-local, which is exactly the space the skin matrices consume.
+      sm.bindMode = 'attached';
+      sm.bind(new THREE.Skeleton(meshBones, boneInverses), new THREE.Matrix4());
+      sm.frustumCulled = false; // bounds are for the bind pose, not the skin
+      group.add(sm);
+    } else {
+      group.add(new THREE.Mesh(g, material));
+    }
+  }
+
+  if (showSkel) {
+    for (const sk of skeletons) {
+      for (const root of sk.roots) {
+        const helper = new THREE.SkeletonHelper(root);
+        helper.material.linewidth = 2;
+        group.add(helper);
+      }
+    }
   }
 
   // NIF/Gamebryo is Z-up; Three.js is Y-up. The exporter deliberately keeps the
@@ -236,10 +343,19 @@ function show(model, bin, textureUrlFor) {
   // scene and framed. Textures may still be streaming in.
   window.__gfLoaded = { meshes: model.meshes.length, vertices: verts, triangles: tris };
 
+  const skinnedMeshes = model.meshes.filter(m => m.isSkinned).length;
+  const skels = model.skeletons || [];
+  const boneTotal = skels.reduce((a, s) => a + s.bones.length, 0);
+  const skinLine = skels.length
+    ? `skeletons ${skels.length} (${boneTotal} bones, root "${skels[0].rootName}")   ` +
+      `skinned meshes ${skinnedMeshes}/${model.meshes.length}`
+    : `<span class="warn">no skeleton (static model)</span>`;
+
   log([
     `<span class="ok">${model.sourceNif}</span>`,
     `meshes ${model.meshes.length}  (${strips} from NiTriStrips)   materials ${model.materials.length}`,
     `vertices ${verts.toLocaleString()}   triangles ${tris.toLocaleString()}   degenerate dropped ${degen.toLocaleString()}`,
+    skinLine,
     missing ? `<span class="warn">${missing} material(s) with unresolved textures</span>` : `<span class="ok">all textures resolved</span>`,
     ...new Set(notes),
   ].join('\n'));
@@ -289,7 +405,7 @@ document.getElementById('load').onclick = () => {
 pathInput.onkeydown = e => { if (e.key === 'Enter') document.getElementById('load').click(); };
 document.getElementById('files').onchange = e => loadFromFiles(e.target.files);
 
-for (const id of ['wire', 'tex', 'vcol', 'zup']) {
+for (const id of ['wire', 'tex', 'vcol', 'zup', 'skel', 'skin']) {
   document.getElementById(id).onchange = () => { if (lastReload) lastReload(); };
 }
 

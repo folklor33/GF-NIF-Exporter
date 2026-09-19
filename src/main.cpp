@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -178,6 +179,10 @@ int RunExport(const std::vector<std::string>& args) {
     size_t totalVertices = 0, totalTriangles = 0;
     int totalDegenerate = 0, totalSkipped = 0, totalWarnings = 0, maxDepth = 0;
     int texturesResolved = 0, texturesMissing = 0;
+    int totalHelpersDropped = 0, totalHiddenDropped = 0;
+    int filesWithSkeleton = 0, totalBones = 0, maxBones = 0, totalSkinsFailed = 0;
+    int mixedSkinFiles = 0;
+    gfnif::SkinningStats skinning;
     std::vector<std::string> failures;
     std::vector<std::string> unresolvedTextures;
 
@@ -224,8 +229,31 @@ int RunExport(const std::vector<std::string>& args) {
         totalTriangles += scene.TotalTriangles();
         totalDegenerate += res.degenerateTrianglesDropped;
         totalSkipped += res.geometriesSkipped;
+        totalHelpersDropped += res.helperGeometriesDropped;
+        totalHiddenDropped += res.hiddenGeometriesDropped;
         totalWarnings += static_cast<int>(res.warnings.size());
         maxDepth = std::max(maxDepth, res.maxDepthSeen);
+
+        skinning.Merge(res.skinning);
+        totalSkinsFailed += res.skinsFailed;
+        if (!scene.skeletons.empty()) {
+            ++filesWithSkeleton;
+            for (const gfnif::SkeletonData& s : scene.skeletons) {
+                totalBones += static_cast<int>(s.bones.size());
+                maxBones = std::max(maxBones, static_cast<int>(s.bones.size()));
+            }
+            // Question 3 of the brief: do skinned and unskinned meshes coexist
+            // in one file, and does skeletonIndex = -1 hold up for the latter?
+            const bool anySkinned =
+                std::any_of(scene.meshes.begin(), scene.meshes.end(),
+                            [](const gfnif::MeshData& m) { return m.isSkinned; });
+            const bool anyStatic =
+                std::any_of(scene.meshes.begin(), scene.meshes.end(),
+                            [](const gfnif::MeshData& m) { return !m.isSkinned; });
+            if (anySkinned && anyStatic) {
+                ++mixedSkinFiles;
+            }
+        }
 
         std::cout << "  -> " << outBase.string() << ".gfmodel/.gfbin\n";
         std::cout << "     " << scene.meshes.size() << " mesh(es), " << scene.materials.size()
@@ -233,6 +261,10 @@ int RunExport(const std::vector<std::string>& args) {
                   << scene.TotalTriangles() << " tris";
         if (res.degenerateTrianglesDropped > 0) {
             std::cout << ", " << res.degenerateTrianglesDropped << " degenerate dropped";
+        }
+        if (!scene.skeletons.empty()) {
+            std::cout << ", " << scene.skeletons[0].bones.size() << " bones/"
+                      << res.skinning.skinnedMeshes << " skinned";
         }
         std::cout << "\n";
 
@@ -255,8 +287,76 @@ int RunExport(const std::vector<std::string>& args) {
     std::cout << "Triangles         : " << totalTriangles << "\n";
     std::cout << "Degenerate dropped: " << totalDegenerate << "\n";
     std::cout << "Geometries skipped: " << totalSkipped << "\n";
+    std::cout << "Max helpers dropped: " << totalHelpersDropped
+              << " (bone/biped/box gizmos, untextured)\n";
+    std::cout << "Hidden geoms dropped: " << totalHiddenDropped
+              << " (NiAVObject visibility flag)\n";
     std::cout << "Warnings          : " << totalWarnings << "\n";
     std::cout << "Max node depth    : " << maxDepth << "\n";
+
+    std::cout << "\n--- skinning ---------------------------------------------------\n";
+    std::cout << "Files with skeleton: " << filesWithSkeleton << "\n";
+    std::cout << "Skeletons           : " << skinning.skeletons << " (" << totalBones
+              << " bones total, max " << maxBones << " in one file)\n";
+    std::cout << "Skinned meshes      : " << skinning.skinnedMeshes << "\n";
+    std::cout << "Skinned vertices    : " << skinning.skinnedVertices << "\n";
+    std::cout << "Mixed skinned/static: " << mixedSkinFiles << " file(s)\n";
+    std::cout << "Skins failed        : " << totalSkinsFailed << " (exported static)\n";
+
+    // The measurement the truncation policy rests on: how many influences the
+    // source actually puts on a vertex, against the 4 the format allows.
+    std::cout << "Max influences/vert : " << skinning.maxInfluencesSeen << "\n";
+    std::cout << "Influence histogram :\n";
+    for (int i = 0; i <= gfnif::SkinningStats::kMaxTrackedInfluences; ++i) {
+        if (skinning.influenceHistogram[i] == 0) {
+            continue;
+        }
+        const double pct = skinning.skinnedVertices > 0
+                               ? 100.0 * static_cast<double>(skinning.influenceHistogram[i]) /
+                                     static_cast<double>(skinning.skinnedVertices)
+                               : 0.0;
+        std::cout << "  " << i << (i == gfnif::SkinningStats::kMaxTrackedInfluences ? "+" : " ")
+                  << " influence(s): " << skinning.influenceHistogram[i] << " ("
+                  << std::fixed << std::setprecision(3) << pct << "%)\n";
+    }
+    std::cout << std::defaultfloat;
+    std::cout << "Vertices truncated  : " << skinning.verticesTruncated;
+    if (skinning.skinnedVertices > 0) {
+        std::cout << " (" << std::fixed << std::setprecision(4)
+                  << (100.0 * static_cast<double>(skinning.verticesTruncated) /
+                      static_cast<double>(skinning.skinnedVertices))
+                  << "%)" << std::defaultfloat;
+    }
+    std::cout << "\n";
+    std::cout << "Weight discarded    : total " << skinning.weightDiscarded << ", max single "
+              << skinning.maxWeightDiscarded << "\n";
+    std::cout << "Unweighted & drawn  : " << skinning.unweightedVerticesInUse
+              << " vertex/vertices\n";
+
+    std::cout << "Skinned from partit.: " << skinning.skinsFromPartition
+              << " mesh(es) (NiSkinData had no weights)\n";
+    std::cout << "InvBind conflicts   : " << skinning.boneSkinMatrixConflicts << " (max delta "
+              << skinning.maxSkinMatrixConflict << ")\n";
+    std::cout << "NiSkinPartition     : " << skinning.partitionsChecked << " checked, "
+              << skinning.partitionsMissing << " absent\n";
+    std::cout << "  influences compared : " << skinning.partitionVerticesCompared << "\n";
+    std::cout << "  bone missing in data: " << skinning.partitionBoneMissing << "\n";
+    std::cout << "    ...on a vertex NiSkinData never weights: "
+              << skinning.partitionBoneMissingOnUnweighted << "\n";
+    // The number that must stay 0: an influence on a vertex NiSkinData DOES
+    // weight, where the partition names a bone we did not read. That would be
+    // a mis-read of the bone mapping. Anything on an entirely unweighted vertex
+    // is a corpus gap instead, handled by the root-pin fallback.
+    std::cout << "    ...contradicting a weighted vertex: "
+              << (skinning.partitionBoneMissing - skinning.partitionBoneMissingOnUnweighted)
+              << "   <-- must be 0\n";
+    std::cout << "  bone truncated away : " << skinning.partitionBoneTruncatedAway
+              << " (expected, we cap at " << gfnif::kInfluencesPerVertex << ")\n";
+    std::cout << "  weight differs      : " << skinning.partitionWeightMismatches
+              << " (expected: partition caps+renormalises)\n";
+    std::cout << "  partition < ours    : " << skinning.partitionWeightBelowOurs
+              << " (max shortfall " << skinning.maxPartitionBelowDelta << ")\n";
+    std::cout << "  max weight delta    : " << skinning.maxPartitionWeightDelta << "\n";
 
     const int texTotal = texturesResolved + texturesMissing;
     std::cout << "Textures resolved : " << texturesResolved << "/" << texTotal;
