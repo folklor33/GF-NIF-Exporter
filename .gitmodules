@@ -1,0 +1,3 @@
+[submodule "external/niflib"]
+	path = external/niflib
+	url = https://github.com/niftools/niflib.git

@@ -1,0 +1,14 @@
+# Build output
+build/
+out/
+*.user
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+
+# vcpkg manifest install tree
+vcpkg_installed/
+
+# Test corpus: large binary game assets, not source
+input/

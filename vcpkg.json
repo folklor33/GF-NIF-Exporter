@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "gf-nif-export",
+  "version-string": "0.1.0",
+  "description": "Grand Fantasia NIF/KF exporter to a lightweight JSON + binary format",
+  "homepage": "https://github.com/niftools/niflib",
+  "dependencies": []
+}
