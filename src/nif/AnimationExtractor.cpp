@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -392,10 +393,19 @@ bool ExtractInterpolator(Niflib::NiInterpolator* interp, AnimationTrack& track,
             clip.wasResampledFromBSpline = true;
             clip.bSplineSampleRate = kBSplineSampleRateHz;
             clip.durationSeconds = std::max(clip.durationSeconds, duration);
+        } else if (empty) {
+            // A real, named ControllerLink whose interpolator simply carries no
+            // channel data for this clip -- the bone does not move here, not a
+            // failure to extract anything. Kept as a resolved track with every
+            // channel empty (see AnimationTrack's own doc comment: an empty
+            // channel means "keep bind pose") rather than silently vanishing,
+            // which previously left a consumer with no data for that bone at
+            // all in this clip -- on monster/M009's stand01, that was the
+            // entire core skeleton (Pelvis/Spine/both legs), not a rare edge.
         } else {
-            outGenuineFailure = !empty;
+            outGenuineFailure = true;
         }
-        return ok;
+        return ok || empty;
     }
     if (auto* classic = dynamic_cast<Niflib::NiTransformInterpolator*>(interp)) {
         bool usedEuler = false;
@@ -419,10 +429,15 @@ bool ExtractInterpolator(Niflib::NiInterpolator* interp, AnimationTrack& track,
             for (const VectorKey& k : track.scales) {
                 clip.durationSeconds = std::max(clip.durationSeconds, k.time);
             }
+        } else if (staticPoseOnly) {
+            // Same reasoning as the B-spline-empty case just above: a
+            // NiTransformInterpolator with no NiTransformData at all is a
+            // legitimately resolved, motionless track, not a failure -- keep
+            // it (empty channels) rather than dropping it.
         } else {
-            outGenuineFailure = !staticPoseOnly;
+            outGenuineFailure = true;
         }
-        return ok;
+        return ok || staticPoseOnly;
     }
     // Some other interpolator family: a NiFloatInterpolator/NiPoint3Interpolator
     // riding the same NiControllerSequence for a material/UV/visibility
@@ -440,7 +455,8 @@ bool ExtractInterpolator(Niflib::NiInterpolator* interp, AnimationTrack& track,
 
 } // namespace
 
-std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root) {
+std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root,
+                                          std::map<Niflib::NiAVObject*, int>& outObjectToIndex) {
     std::vector<SceneNode> nodes;
     if (root == nullptr) {
         return nodes;
@@ -472,6 +488,7 @@ std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root) {
         n.parentIndex = item.parentIndex;
         ToColumnMajorLocal(item.obj->GetLocalTransform(), n.localMatrix);
         nodes.push_back(std::move(n));
+        outObjectToIndex[item.obj] = index;
 
         if (auto* node = dynamic_cast<Niflib::NiNode*>(item.obj)) {
             for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
@@ -481,6 +498,11 @@ std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root) {
     }
 
     return nodes;
+}
+
+std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root) {
+    std::map<Niflib::NiAVObject*, int> unused;
+    return BuildNodeHierarchy(root, unused);
 }
 
 AnimationExtractor::AnimationExtractor(std::vector<std::string>* warnings) : warnings_(warnings) {}

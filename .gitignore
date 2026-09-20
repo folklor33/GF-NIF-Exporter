@@ -2,6 +2,7 @@
 build/
 build-asan/
 out/
+out_test2/
 *.user
 
 # Visual Studio

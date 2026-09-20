@@ -165,6 +165,23 @@ struct MeshData {
      *  with the bind-pose skin matrix this particular skin supplies. Empty when
      *  not skinned. */
     std::vector<SkinBinding> skinBindings;
+
+    /*! Index into SceneData::nodes, or -1 when the mesh keeps its default
+     *  world-space-flattened vertices (see SceneData::nodes and PHASE4
+     *  follow-up: the WA85 case).
+     *
+     *  Set only for the rare skeleton-less file where this mesh's own
+     *  NiAVObject (or an ancestor) is the target of a real embedded/`.kf`
+     *  animation track -- i.e. scene.nodes is populated AND something in it
+     *  actually moves. In that case `vertices` are node-local (relative to
+     *  this node, matching the skinned-mesh convention of never baking a
+     *  transform that would move at runtime) instead of pre-flattened to
+     *  world space, so a consumer parents the mesh under
+     *  SceneData::nodes[nodeIndex] and lets the animated node hierarchy carry
+     *  it -- otherwise the animation moves an empty pivot while the baked,
+     *  disconnected geometry stays put. Every other mesh in the corpus keeps
+     *  -1 and today's flattened-world-space vertices unchanged. */
+    int nodeIndex = -1;
 };
 
 /*! Material parameters, flattened from the NiProperty list attached to a

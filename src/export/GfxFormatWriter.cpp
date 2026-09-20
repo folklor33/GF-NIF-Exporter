@@ -273,6 +273,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "      \"degenerateTrianglesDropped\": " << m.degenerateTrianglesDropped << ",\n";
         js << "      \"isSkinned\": " << (m.isSkinned ? "true" : "false") << ",\n";
         js << "      \"skeletonIndex\": " << m.skeletonIndex << ",\n";
+        js << "      \"nodeIndex\": " << m.nodeIndex << ",\n";
         // glTF "joints" + "inverseBindMatrices", folded into one list: entry j
         // is the bone that this mesh's skinIndex value j refers to, with the
         // inverse bind matrix *this* skin supplies for it.

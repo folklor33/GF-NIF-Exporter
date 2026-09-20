@@ -74,6 +74,25 @@ public:
     /*! The NiNode the skeleton was built from, or nullptr if none. */
     Niflib::NiNode* SkeletonRoot() const { return skeletonRoot_; }
 
+    /*! Corrects `scene.skeletons[SkeletonIndex()]`'s bindMatrixLocal for every
+     *  bone a skin actually weighted, replacing the NiNode's own (possibly
+     *  stale) local transform with the rest pose the skin's own bind data
+     *  implies.
+     *
+     *  A Gamebryo file's NiNode hierarchy and its NiSkinData are authored
+     *  independently, and 479 files in this corpus disagree between them by
+     *  more than a token amount (this session's follow-up measurement) --
+     *  most visibly on monster/M017, whose node-transform-derived bind pose
+     *  has the model lying flattened on its side while its own skin data
+     *  implies it standing on four legs. blender_niftools_addon's
+     *  `store_bind_matrices()` runs the same correction for the same reason.
+     *
+     *  Call once per file, after every skinned shape has gone through
+     *  ApplySkin (so every bone's implied world bind pose has been recorded)
+     *  and before the file's SceneData is handed back to the caller. A no-op
+     *  when the file has no skeleton or no skin coverage at all. */
+    void ReconstructBindPoseFromSkin(SceneData& scene);
+
 private:
     /*! One bone influence on one vertex, before the 4-slot cap is applied. */
     struct Influence {
@@ -112,6 +131,15 @@ private:
     /*! Bindings seen on earlier skins of this file, used only to measure how
      *  often two skins disagree about a shared bone's inverse bind matrix. */
     std::vector<SkinBinding> priorBindings_;
+
+    /*! Per-bone world bind pose implied by the first skin seen weighting that
+     *  bone (bone index in scene.skeletons[skeletonIndex_].bones -> world
+     *  matrix), recorded by ApplySkin for ReconstructBindPoseFromSkin to
+     *  apply once the file's skins are all in. First-seen wins on conflict,
+     *  matching the existing boneSkinMatrixConflicts measurement's own
+     *  precedent of not trying to pick a "best" answer among disagreeing
+     *  skins. Row-vector convention throughout, like the rest of this file. */
+    std::map<int, Niflib::Matrix44> impliedBoneWorldBind_;
 };
 
 } // namespace gfnif

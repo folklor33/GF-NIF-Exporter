@@ -169,7 +169,8 @@ void WalkNode(Niflib::NiAVObject* obj,
               std::set<NiObject*>& visited,
               ExtractionResult& result,
               int depth,
-              bool verifyStrips) {
+              bool verifyStrips,
+              std::vector<Niflib::NiAVObject*>* meshSourceObjects = nullptr) {
     if (obj == nullptr || !visited.insert(obj).second) {
         return;
     }
@@ -191,7 +192,7 @@ void WalkNode(Niflib::NiAVObject* obj,
     if (auto* node = dynamic_cast<Niflib::NiNode*>(obj)) {
         for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
             WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, skeletons,
-                     visited, result, depth + 1, verifyStrips);
+                     visited, result, depth + 1, verifyStrips, meshSourceObjects);
         }
         return;
     }
@@ -354,6 +355,9 @@ void WalkNode(Niflib::NiAVObject* obj,
     }
 
     scene.meshes.push_back(std::move(mesh));
+    if (meshSourceObjects != nullptr) {
+        meshSourceObjects->push_back(obj);
+    }
 }
 
 } // namespace
@@ -447,6 +451,13 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
     }
 
+    // Parallel to scene.meshes, recording which NiAVObject each entry came
+    // from -- needed only if this file turns out to need the animated-mesh
+    // reattachment pass below (see nodesPtr/scene.nodes), so a mesh can be
+    // matched back to its owning node by pointer identity rather than by name
+    // (names collide routinely, e.g. WA85's three "Editable Mesh" siblings).
+    std::vector<Niflib::NiAVObject*> meshSourceObjects;
+
     std::set<NiObject*> visited;
     for (const NiObjectRef& b : blocks) {
         NiObject* obj = static_cast<NiObject*>(b);
@@ -455,11 +466,19 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
         if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
             WalkNode(av, Matrix44::IDENTITY, scene, materials, skeletons, visited, result, 0,
-                     verifyStrips);
+                     verifyStrips, &meshSourceObjects);
         }
     }
 
     result.skinning.skeletons = static_cast<int>(scene.skeletons.size());
+
+    // Every skinned shape's ApplySkin call above has now recorded what its
+    // own skin data implies about each bone's bind pose; correct the
+    // exported skeleton's bindMatrixLocal to match before anything (the
+    // animation pass below, or the caller) reads it. See
+    // ReconstructBindPoseFromSkin's doc comment for why the NiNode
+    // hierarchy's own transform is not trusted as-is.
+    skeletons.ReconstructBindPoseFromSkin(scene);
 
     if (scene.meshes.empty()) {
         // Distinguish "every shape was explicitly hidden by the source file"
@@ -509,6 +528,12 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
             scene.skeletons.empty() ? nullptr : &scene.skeletons[0];
 
         std::vector<SceneNode> nodes;
+        // Parallel to `nodes`: which NiAVObject each entry came from, offset
+        // exactly the way `nodes` itself is below -- used only by the
+        // animated-mesh reattachment pass after clipsBefore/animations are
+        // known, to map a mesh (recorded by pointer in meshSourceObjects)
+        // back to its node index without relying on name matching.
+        std::map<Niflib::NiAVObject*, int> objectToNodeIndex;
         if (skeleton == nullptr) {
             for (const NiObjectRef& b : blocks) {
                 NiObject* obj = static_cast<NiObject*>(b);
@@ -516,7 +541,8 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
                     continue;
                 }
                 if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
-                    std::vector<SceneNode> rootNodes = BuildNodeHierarchy(av);
+                    std::map<Niflib::NiAVObject*, int> rootObjectToIndex;
+                    std::vector<SceneNode> rootNodes = BuildNodeHierarchy(av, rootObjectToIndex);
                     // Re-parent every subsequent root's own roots (parentIndex
                     // == -1) onto nothing but keep them appended, exactly as
                     // the mesh walk treats independent unreferenced roots as
@@ -527,6 +553,9 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
                         if (n.parentIndex >= 0) {
                             n.parentIndex += offset;
                         }
+                    }
+                    for (auto& [rootObj, idx] : rootObjectToIndex) {
+                        objectToNodeIndex[rootObj] = idx + offset;
                     }
                     nodes.insert(nodes.end(), std::make_move_iterator(rootNodes.begin()),
                                  std::make_move_iterator(rootNodes.end()));
@@ -560,6 +589,60 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         // node list needs it exported; every other skeleton-less file (the
         // large majority, per PHASE4_FINDINGS) keeps scene.nodes empty.
         if (nodesPtr != nullptr && scene.animations.size() > clipsBefore) {
+            // Reattach every mesh whose own node (or an ancestor of it) is
+            // actually the target of a resolved track. Without this, a track
+            // moves an empty SceneNode pivot while the mesh's geometry --
+            // pre-flattened to world space by the walk above, same as every
+            // other static mesh -- stays put: WA85's "1.50s / 2 tracks but
+            // nothing moves" symptom (see PHASE4_FINDINGS's WA85 section and
+            // this session's follow-up). A mesh not covered by this (the
+            // overwhelming majority of skeleton-less files, which either have
+            // no animation at all or animate a node with no geometry
+            // anywhere under it) keeps today's flattened vertices and
+            // nodeIndex == -1, unchanged.
+            std::vector<bool> nodeIsAnimated(nodes.size(), false);
+            for (const AnimationClip& clip : scene.animations) {
+                for (const AnimationTrack& track : clip.tracks) {
+                    if (track.boneIndex >= 0 &&
+                        static_cast<size_t>(track.boneIndex) < nodes.size()) {
+                        nodeIsAnimated[track.boneIndex] = true;
+                    }
+                }
+            }
+            // Propagate to every descendant: a rigid child of an animated
+            // node must move with it even though nothing targets the child
+            // directly. Nodes are parent-before-child, so a single forward
+            // pass suffices.
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const int parent = nodes[i].parentIndex;
+                if (parent >= 0 && nodeIsAnimated[parent]) {
+                    nodeIsAnimated[i] = true;
+                }
+            }
+
+            for (size_t i = 0; i < scene.meshes.size(); ++i) {
+                if (i >= meshSourceObjects.size()) {
+                    continue; // defensive: sizes are kept in lockstep above
+                }
+                auto it = objectToNodeIndex.find(meshSourceObjects[i]);
+                if (it == objectToNodeIndex.end() || !nodeIsAnimated[it->second]) {
+                    continue;
+                }
+                MeshData& mesh = scene.meshes[i];
+                if (mesh.isSkinned) {
+                    continue; // already node-independent (skin matrices carry placement)
+                }
+                const Matrix44 nodeWorldInverse =
+                    meshSourceObjects[i]->GetWorldTransform().Inverse();
+                for (StaticVertex& v : mesh.vertices) {
+                    const Niflib::Vector3 worldPos(v.position[0], v.position[1], v.position[2]);
+                    const Niflib::Vector3 worldNormal(v.normal[0], v.normal[1], v.normal[2]);
+                    TransformPosition(nodeWorldInverse, worldPos, v.position);
+                    TransformNormal(nodeWorldInverse, worldNormal, v.normal);
+                }
+                mesh.nodeIndex = it->second;
+            }
+
             scene.nodes = std::move(nodes);
         }
     }

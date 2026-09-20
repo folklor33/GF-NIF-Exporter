@@ -13,6 +13,7 @@
 
 #include "export/SceneModel.hpp"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,15 @@ namespace gfnif {
  *  real embedded animation track to resolve against it, so files with no
  *  embedded controllers at all pay nothing extra). */
 std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root);
+
+/*! Same walk as BuildNodeHierarchy, but also records each node's source
+ *  NiAVObject pointer, keyed by its index in the returned vector -- used by
+ *  MeshExtractor's animated-mesh reattachment pass to match a mesh (recorded
+ *  by pointer during its own, separate walk) back to its node index, since
+ *  matching by name is unreliable (sibling nodes routinely share a name, e.g.
+ *  three "Editable Mesh" nodes in the same file). */
+std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root,
+                                          std::map<Niflib::NiAVObject*, int>& outObjectToIndex);
 
 /*! Extracts animation clips for one .nif, given the SkeletonData already built
  *  for it (or an empty one, for a file with animation controllers but no

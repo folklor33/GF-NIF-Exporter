@@ -1050,7 +1050,242 @@ sources are not relying on each other).
 
 ---
 
-## 14. Reproducing (Phase 4 overall)
+## 14. Follow-up session: model orientation, WA85 motion, M009 tilt
+
+Three problems reported after visual re-check of §12/§13's fixes: several
+"couché"/"en l'air" monster models still looking wrong, `item/WA85`'s
+now-resolved 2-track clip (§12.4) still producing no visible motion, and
+`monster/M009`'s `stand01`/`magic01` still tilted. All three were
+investigated the same way as every prior gap in this project: measure first,
+against an independent reference, rather than reasoning from the exported
+JSON alone.
+
+### 14.1 Model orientation — not an exporter defect; the reference tool itself needed a correction
+
+The brief's suggested approach — convert the same files to `.obj` via
+`blender_niftools_addon` (`tools/nif_to_obj.py`) and compare against the
+exporter's own output — was followed, but the addon's legacy
+`bpy.ops.export_scene.obj` operator no longer exists in Blender 5.2 (renamed
+`wm.obj_export`, different parameter names); a scratch-only patched copy was
+used for this session's runs (`tools/nif_to_obj.py` itself is unmodified — a
+Blender-version compatibility fix is a separate concern from this
+investigation).
+
+**Numeric self-check first, per this project's standing discipline
+([[gf-nif-exporter-external-reference]]).** A C++ diagnostic
+(`compare_skin_deformation.cpp`, not committed) computed the exact same
+formula `SkeletonExtractor::ApplySkin` uses (`vertexWorld = v * (boneOffset *
+boneWorld)`) directly against niflib's own `NiGeometry::GetSkinDeformation`
+reference implementation, for the four sampled models (`M011`, `M017`,
+`M028`, `M389`). **Result: 0 to 1.5e-8 max vertex difference on all four** —
+the exporter's skin math is exactly correct; niflib's own reference agrees to
+floating-point precision.
+
+**Visual re-render of the exporter's own computed geometry** (not statistics,
+an actual rendered image, reconstructed in Node.js/three.js using the
+viewer's own `SkinnedMesh`/`boneInverses` formula and rendered via headless
+Blender) confirmed `M389`, `M011`, and `M028` stand correctly. Only `M017`
+still rendered lying flat/splayed.
+
+**M017, isolated**: `M017`'s raw `NiNode` hierarchy transforms disagree with
+its own `NiSkinData` bind data — a real, independently-verified Gamebryo
+authoring quirk (confirmed corpus-wide at **479 files**, measured via
+`boneOffset.Inverse() * geomWorld` vs `bone->GetWorldTransform()`, tolerance
+0.05). `blender_niftools_addon`'s `nif_import/armature/__init__.py`
+(`store_bind_matrices()`) runs an equivalent correction on import, which is
+why Blender's own display looked "correct" while the raw node-transform data
+did not — the addon's displayed pose was never the file's literal node-local
+transform to begin with. See §14.2 for the exporter-side fix.
+
+**Conclusion: no missing rotation matrix in the exporter.** The four sampled
+"problem" models were already geometrically correct at the vertex level; the
+only real defect was in the skeleton's *bind pose* for files matching the
+§14.2 pattern.
+
+### 14.2 Fix: skeleton bind pose reconstructed from skin data, not trusted from NiNode transforms
+
+`SkeletonExtractor::ReconstructBindPoseFromSkin()` (new method, called once
+per file from `MeshExtractor::ExtractScene` after every skinned shape's
+`ApplySkin` has run) replaces each bone's `bindMatrixLocal` with the world
+bind pose implied by that bone's own skin data
+(`boneOffset.Inverse() * geomWorld`, row-vector convention, matching
+`blender_niftools_addon`'s `get_skin_bind()` exactly) wherever a skin
+actually weighted that bone. A bone no skin ever weighted keeps its authored
+`NiNode` local transform, re-anchored under the corrected parent chain so the
+hierarchy does not tear at the boundary between corrected and uncorrected
+bones. First skin to weight a shared bone wins on conflict (reuses the
+existing `boneSkinMatrixConflicts` measurement's own precedent rather than
+adding a new tie-break rule).
+
+Verified on `M017`: reconstructed bone world positions (e.g. `Bip01 Pelvis`
+at `(0, 0.728, 0.762)`) now match `blender_niftools_addon`'s independently-
+computed rest pose to 3 decimal places. Raw mesh vertex positions are
+unaffected (they never depended on `bindMatrixLocal`, only on the already-
+correct per-vertex `skinMatrix`), confirming this only fixes skeleton display
+and animation retargeting, not geometry.
+
+**Not ported**: the addon's cross-skin conflict-resolution logic (warping a
+second skin's vertices to agree with an earlier skin's bind pose) — that
+mechanism only fires when two different `NiSkinInstance`s disagree about a
+*shared* bone, which is a different, narrower situation than the single-skin
+case this fix addresses, and this corpus's existing `boneSkinMatrixConflicts`
+metric already tracks how often that would matter.
+
+### 14.3 WA85 — real fix: animated meshes were never reattached to their node
+
+**Root cause, unrelated to the Euler fix.** `MeshExtractor`'s mesh walk
+flattens every unskinned mesh's vertices to world space at export time
+(Phase 2 behavior, correct for the ~99% of meshes with no animation on their
+own node), then discards the association between a mesh and the `NiAVObject`
+it came from. For `WA85`'s two animated planes, this means the
+`NiTransformController` genuinely produces correct, real quaternion motion
+(verified: two distinct keyframes per track, not identical/degenerate) on an
+`Object3D` node that no rendered mesh is actually parented under — the
+viewer moves an empty pivot while the baked, disconnected geometry stays put.
+This reproduces exactly the symptom (`1.5s / 2 tracks` reported, nothing
+visibly moves).
+
+**Fix**: `MeshData` gains `nodeIndex` (into `SceneData::nodes`, default -1).
+`MeshExtractor::ExtractScene` records each mesh's source `NiAVObject*`
+alongside the existing mesh walk (`meshSourceObjects`, parallel to
+`scene.meshes`) and `BuildNodeHierarchy` gained an overload returning a
+`NiAVObject* -> node index` map. After animation extraction determines which
+node indices are genuinely targeted by a resolved track (propagated to every
+descendant, since a rigid child of an animated node must move with it even
+though nothing targets the child directly), any mesh whose source object
+maps to an animated node has its vertices re-based from world space to
+node-local space (`nodeWorld.Inverse()`, undoing the original bake) and its
+`nodeIndex` set. Every other mesh — the overwhelming majority — is
+untouched: same flattened-world vertices, `nodeIndex = -1`.
+
+The viewer (`tools/viewer/index.html`) parents such a mesh under
+`sceneNodeObjs.objs[m.nodeIndex]` instead of the top-level `group`, so it
+rides the animated `Object3D` exactly as a `SkinnedMesh` rides its skeleton.
+
+**Verified on `WA85`**: both "Editable Mesh" children of `Plane04`/`Plane03`
+(previously indistinguishable by name — three siblings share it) correctly
+resolved to their respective node indices (6 and 8) by pointer identity, and
+only those two meshes were reattached; the other two meshes on the same file
+correctly kept `nodeIndex = -1`.
+
+**Corpus-wide, this pattern is not rare**: re-exporting the full corpus with
+the fix reattaches **1397 meshes across 265 files**, overwhelmingly
+`item/model/W*` (weapons) and `effect/model/S*` (spell effects) — glow
+planes and particle-emitter geometry riding an animated pivot, the same
+shape as `WA85`. No file's mesh/material/skeleton/animation *counts* changed
+(structural non-regression confirmed across all 2822 convertible files);
+only the vertex space and `nodeIndex` of the affected meshes changed.
+
+### 14.4 M009 — real fix found (dropped tracks), tilt itself not re-confirmed visually this session
+
+**§12.1's clip-switch bind-pose-restore fix and §13's `XYZ_ROTATION_KEY`
+composition fix were re-checked and are not at fault.** `Bone01/03/05/06`
+(the bones §12.1 flagged as "scale-only, frozen") now carry genuine composed
+quaternion rotation in both `stand01`/`magic01` and the "working" clips —
+the Euler fix reached them correctly.
+
+**A separate, real defect found**: `AnimationExtractor::ExtractInterpolator`
+silently dropped a `ControllerLink` whose interpolator resolved to a
+recognized transform family but carried **no timeline data for this specific
+clip** (`NiTransformInterpolator` with `GetData() == nullptr` — "static pose
+only", or an empty `NiBSplineTransformInterpolator`) — the track was never
+appended to `clip.tracks` at all, not even as an orphan, and no warning was
+emitted. Measured on `M009`'s `stand01`: **32 of 71 skeleton bones**,
+including `Bip01 Pelvis`, `Bip01 Spine`, and all four thigh/calf/foot bones,
+had no track whatsoever in the exported clip, down from a real
+`ControllerLink` in the source `.kf` for every one of them. Corpus-wide this
+is not rare either — `tracksStaticPoseOnly` was already **200 rows on
+`M009`'s 8 clips alone** before this fix, all silently discarded.
+
+**Fix**: `ExtractInterpolator` now returns success (with every channel left
+empty) for a static-pose-only classic track or an empty B-spline track,
+instead of failure — both call sites (`ExtractEmbedded`, `ExtractFromKf`)
+already push whatever track comes back and resolve its `boneIndex`
+unconditionally, so no other code changed. An empty-channel track is not a
+new concept: `AnimationTrack`'s own doc comment already specifies "the
+consumer keeps the bone's bind-pose value" for an empty channel — this fix
+only stops discarding the bookkeeping that says the track was there and
+resolved, not partially inventing new interpolation behavior.
+
+**Verified on `M009`**: `stand01`'s track count went from 39 to 64 (every
+`ControllerLink` in the clip now resolves and is kept); `Bip01 Pelvis` etc.
+now carry a resolved, empty-channel track instead of nothing.
+
+**Not confirmed as THE tilt fix.** This session's own attempt to
+independently re-render `M009`'s posed clips (a from-scratch three.js/Node.js
+skinning+animation reconstruction, not the actual viewer) produced visibly
+torn/broken geometry on **both** `stand01` and a clip the user reports as
+already correct (`move01`) — strong evidence of a bug in that one-off
+reconstruction script itself (most likely in B-spline keyframe sampling,
+211/512 of `M009`'s tracks are B-spline-resampled), not new evidence about
+the exported data. The dropped-track fix is real and worth keeping
+regardless — a clip missing tracks for the entire core skeleton is a defect
+on its own — but whether it is sufficient to resolve the visually-reported
+tilt needs the browser re-check listed in §14.5, not a reconstruction from
+this session.
+
+### 14.5 Non-regression and files to re-check
+
+Full corpus re-exported after all three fixes (WA85 reattachment, M017 bind
+pose, M009 dropped tracks): same 3 permanent failures as every prior pass
+(`item/WF20`, `monster/M156`, `npc/N600`), no new ones. Mesh/material/
+skeleton counts unchanged file-for-file across all 2822 convertible files —
+only vertex space (for the 265 newly-reattached files) and `bindMatrixLocal`
+(for the 479 bind-pose-corrected files) changed, plus animation track counts
+increased wherever a `ControllerLink` had previously been dropped.
+
+**Files to re-check visually in the browser:**
+
+1. **`monster/model/M017.gfmodel`** — should now stand on four legs in bind
+   pose and show a correctly-shaped skeleton (`skel` toggle) instead of the
+   splayed/lying pose. `M389`/`M011`/`M028` (already correct) should be
+   unchanged.
+2. **`item/model/WA85.gfmodel`** — the two glow-plane meshes should now
+   visibly animate on the `1.5s` clip instead of the model staying static.
+3. Spot-check a few of the 265 newly-reattached files for a visible
+   regression from the vertex-space change — suggested:
+   `item/model/W146`, `item/model/W167`, `effect/model/S13103`,
+   `effect/model/S14141` (all gained `nodeIndex` on at least one mesh, per
+   this session's corpus scan).
+4. **`monster/model/M009.gfmodel`**, `stand01` and `magic01` — re-check
+   whether the tilt is gone now that every clip drives the full skeleton;
+   if it persists, the next lead is the B-spline sampling path specifically
+   (§14.4's own reconstruction attempt broke on both a "good" and a "bad"
+   clip, so the bug — if still present after this fix — likely lives in how
+   B-spline tracks are sampled/rendered, not in per-clip data differences).
+5. Full non-regression pass across a handful of previously-verified files
+   (`M389`, plus one file from each entity type) to confirm nothing else
+   moved.
+
+### 14.6 Reproducing this section's measurements
+
+```
+tools\diag\compare_skin_deformation.cpp   # §14.1: skin math vs GetSkinDeformation, corpus-wide bind-pose mismatch scan, .kf NULL-interpolator/rotate-type dump
+```
+
+Built the same way as the other diagnostic tools (not wired into CMake):
+
+```
+cl.exe /std:c++17 /permissive- /EHsc /MP /O2 /MD /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /D_SCL_SECURE_NO_WARNINGS /DNIFLIB_STATIC_LINK ^
+  /I"external\niflib\include" /I"src" tools\diag\compare_skin_deformation.cpp ^
+  /Fe:tools\diag\compare_skin_deformation.exe /link build\Release\niflib_static.lib
+```
+
+Usage: `compare_skin_deformation.exe <nif_path>` (single-file skin-math
+check), `compare_skin_deformation.exe measure <root>` (corpus-wide bind-pose
+mismatch scan), `compare_skin_deformation.exe kf <kf_path>` (per-sequence
+`ControllerLink` target/interpolator-type dump).
+
+The Blender-side reference renders (native NIF import, front-orthographic,
+Workbench engine) were produced with `blender.exe -b --python <script> --
+<args>`, Blender 5.2.2 LTS, `io_scene_niftools` v0.1.1 — scratch scripts, not
+committed. `tools/nif_to_obj.py` itself needs a `bpy.ops.export_scene.obj` ->
+`bpy.ops.wm.obj_export` port to run on Blender 5.2+ (noted, not fixed this
+session since a scratch patch was sufficient for this investigation).
+
+---
+
+## 15. Reproducing (Phase 4 overall)
 
 ```
 cmake --build build --config Release

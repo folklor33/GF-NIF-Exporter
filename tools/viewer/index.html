@@ -413,7 +413,16 @@ function buildScene(model, bin, textureUrlFor) {
       sm.frustumCulled = false; // bounds are for the bind pose, not the skin
       group.add(sm);
     } else {
-      group.add(new THREE.Mesh(g, material));
+      const plainMesh = new THREE.Mesh(g, material);
+      // A mesh whose own node (or an ancestor) carries a real animation
+      // track was exported with node-local vertices instead of the usual
+      // flattened-world ones (see MeshData::nodeIndex / the exporter's
+      // WA85 follow-up) specifically so it can be parented here and ride
+      // the animated Object3D -- attaching it to `group` directly, as an
+      // unskinned mesh normally is, would leave it at its rest pose forever
+      // while the empty node animates on its own.
+      const owner = m.nodeIndex >= 0 && sceneNodeObjs ? sceneNodeObjs.objs[m.nodeIndex] : null;
+      (owner || group).add(plainMesh);
     }
   }
 
