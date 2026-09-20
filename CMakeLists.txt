@@ -77,6 +77,7 @@ endif()
 add_executable(gfnif-export
     src/main.cpp
     src/export/GfxFormatWriter.cpp
+    src/nif/AnimationExtractor.cpp
     src/nif/HeaderNormalizer.cpp
     src/nif/MaterialExtractor.cpp
     src/nif/MeshExtractor.cpp

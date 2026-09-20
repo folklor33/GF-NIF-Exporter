@@ -36,7 +36,18 @@ struct ExtractionResult {
     /*! Geometries that carried a NiSkinInstance we could not use and were
      *  therefore exported as static meshes instead. */
     int skinsFailed = 0;
+
+    /*! Animation measurements for this file, merged into a corpus total by the
+     *  caller. */
+    AnimationStats animation;
 };
+
+/*! True if `nifPath` (a .nif under a `<type>/model/` directory) has a
+ *  same-named .kf under the sibling `<type>/animation/` directory, per the
+ *  convention documented in docs/NAMING_CONVENTIONS.md. Returns the resolved
+ *  path in `outKfPath` when found. Exposed for the exporter's own reporting;
+ *  ExtractScene uses it internally too. */
+bool ResolveCompanionKf(const std::string& nifPath, std::string& outKfPath);
 
 /*! Depth past which the node walk gives up on a subtree rather than risking the
  *  stack. Real GF hierarchies are far shallower. */

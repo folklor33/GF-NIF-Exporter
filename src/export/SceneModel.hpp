@@ -297,11 +297,142 @@ struct SkinningStats {
     }
 };
 
+/*! Corpus-wide measurements about animation extraction, accumulated across a
+ *  run -- the evidence for the B-spline sampling-rate decision and the .kf
+ *  track resolution rate. See PHASE4_FINDINGS. */
+struct AnimationStats {
+    int embeddedClips = 0;
+    int kfClips = 0;
+    /*! .nif files that had a companion .kf resolved and loaded. Files with no
+     *  companion are not counted anywhere -- "no .kf" is normal for a model
+     *  with no external animation, not a gap to report (see
+     *  docs/NAMING_CONVENTIONS.md §2). */
+    int kfFilesFound = 0;
+    int tracksTotal = 0;
+    int tracksResolved = 0;
+    int tracksOrphaned = 0;
+
+    int classicTracks = 0;
+    int bSplineTracks = 0;
+    /*! tracksTotal - classicTracks - bSplineTracks - tracksSkippedOutOfScope,
+     *  i.e. a track this phase should have handled but could not. Kept
+     *  separate from tracksSkippedOutOfScope so the two read differently in
+     *  the summary: an out-of-scope track (a property/UV controller riding
+     *  the same ControllerLink array as bone tracks) is expected corpus noise,
+     *  not a defect. */
+    int tracksFailed = 0;
+    /*! ControllerLink entries whose interpolator is not one of the two
+     *  bone-transform families this phase reads (NiTransformInterpolator /
+     *  NiBSplineTransformInterpolator) -- material, UV or visibility
+     *  controllers sharing the same NiControllerSequence. Not a gap: this
+     *  phase only extracts bone transforms. */
+    int tracksSkippedOutOfScope = 0;
+    /*! Classic tracks whose rotation channel used XYZ_ROTATION_KEY (separate
+     *  Euler sub-channels) rather than quaternion keys. Translation/scale
+     *  still extract; only the rotation channel is left empty. Counted here
+     *  so its corpus prevalence is visible without grepping warnings. */
+    int tracksWithUnsupportedEulerRotation = 0;
+    /*! NiTransformInterpolator links whose GetData() is null -- the bone has a
+     *  static pose value for this clip (see NiTransformInterpolator's own
+     *  translation/rotation/scale fields) but no keyframe timeline at all.
+     *  Not a failure: the bone simply does not move in this particular clip.
+     *  Distinct from tracksFailed, which is a track this phase should have
+     *  been able to read but could not. */
+    int tracksStaticPoseOnly = 0;
+    /*! NiBSplineTransformInterpolator links with zero/negative duration or with
+     *  every channel offset unset (USHRT_MAX) -- no translation, rotation, or
+     *  scale data at all. The B-spline equivalent of tracksStaticPoseOnly. */
+    int tracksBSplineEmpty = 0;
+
+    long long totalKeyframesWritten = 0;
+    /*! Tracks whose source animated the scale channel at all (more than the
+     *  single bind-pose value). Answers brief question 6. */
+    int tracksWithScaleAnimated = 0;
+
+    void Merge(const AnimationStats& o) {
+        embeddedClips += o.embeddedClips;
+        kfClips += o.kfClips;
+        kfFilesFound += o.kfFilesFound;
+        tracksTotal += o.tracksTotal;
+        tracksResolved += o.tracksResolved;
+        tracksOrphaned += o.tracksOrphaned;
+        classicTracks += o.classicTracks;
+        bSplineTracks += o.bSplineTracks;
+        tracksFailed += o.tracksFailed;
+        tracksSkippedOutOfScope += o.tracksSkippedOutOfScope;
+        tracksWithUnsupportedEulerRotation += o.tracksWithUnsupportedEulerRotation;
+        tracksStaticPoseOnly += o.tracksStaticPoseOnly;
+        tracksBSplineEmpty += o.tracksBSplineEmpty;
+        totalKeyframesWritten += o.totalKeyframesWritten;
+        tracksWithScaleAnimated += o.tracksWithScaleAnimated;
+    }
+};
+
+/*! One translation/scale keyframe: a time and a 3-component value. */
+struct VectorKey {
+    float time = 0.0f;
+    float value[3] = {0.0f, 0.0f, 0.0f};
+};
+
+/*! One rotation keyframe: a time and a quaternion, stored [x, y, z, w] (the
+ *  glTF/Three.js component order). Component values are copied straight from
+ *  niflib's own {w, x, y, z} with no axis remap -- see AnimationExtractor.cpp
+ *  for why that is safe (no handedness change anywhere in this exporter). */
+struct QuatKey {
+    float time = 0.0f;
+    float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+};
+
+/*! Animation of a single bone within a clip.
+ *
+ *  Channels are independent and may have different key counts/timings, exactly
+ *  as NiTransformData stores them -- a consumer interpolates each channel on
+ *  its own timeline rather than assuming a shared keyframe grid. An empty
+ *  channel means the source did not animate that property; the consumer keeps
+ *  the bone's bind-pose value for it. */
+struct AnimationTrack {
+    /*! Bone name exactly as the source spells it, matching BoneData::name --
+     *  the same string this track was resolved against. Kept even when
+     *  boneIndex resolved successfully, so a consumer can re-bind without
+     *  reparsing the source. */
+    std::string boneName;
+    /*! Index into the clip's target SkeletonData::bones, or -1 when the name
+     *  could not be resolved (an orphaned .kf track). An orphaned track is
+     *  still emitted -- see AnimationClip -- so the corpus-wide resolution
+     *  rate can be measured from the exported data itself. */
+    int boneIndex = -1;
+    std::vector<VectorKey> translations;
+    std::vector<QuatKey> rotations;
+    std::vector<VectorKey> scales;
+};
+
+/*! One animation clip: either an embedded NiControllerSequence-less
+ *  NiTransformController/NiMultiTargetTransformController pass (originFile ==
+ *  "embedded"), or a whole NiControllerSequence loaded from a .kf file
+ *  (originFile == the .kf's filename). */
+struct AnimationClip {
+    /*! Sequence name (from NiControllerSequence) or a synthesised name for the
+     *  embedded case. Not guaranteed unique across clips of one file. */
+    std::string name;
+    /*! "embedded" or the source .kf filename (no directory), so a consumer or
+     *  a report can tell the two paths apart without re-deriving it. */
+    std::string originFile;
+    float durationSeconds = 0.0f;
+    /*! Sampling rate used to resample any NiBSplineCompTransformInterpolator
+     *  track in this clip, in Hz. 0 when the clip has no B-spline track (every
+     *  track kept its native NiTransformData keys, see PHASE4_FINDINGS). */
+    float bSplineSampleRate = 0.0f;
+    /*! True if at least one track in this clip came from a
+     *  NiBSplineCompTransformInterpolator and was resampled rather than kept
+     *  as native keys. */
+    bool wasResampledFromBSpline = false;
+    std::vector<AnimationTrack> tracks;
+};
+
 /*! One converted .nif.
  *
- *  Phase 4+ will add animations / particleSystems members here. The writer
- *  already emits those JSON keys as empty so the schema does not change shape
- *  later. */
+ *  Phase 5 will add particleSystems. The writer already emits that JSON key
+ *  as empty so the schema does not change shape later. */
 struct SceneData {
     std::string sourceNifPath;
     std::vector<MeshData> meshes;
@@ -310,6 +441,9 @@ struct SceneData {
      *  one armature root. Kept as a vector so a file with genuinely separate
      *  armatures would not need a format change. */
     std::vector<SkeletonData> skeletons;
+    /*! Embedded animations plus every .kf found for this file under the
+     *  <type>/animation/NAME.kf convention. Empty when the file has neither. */
+    std::vector<AnimationClip> animations;
 
     /*! Total vertices/triangles across all meshes, for logging. */
     size_t TotalVertices() const {

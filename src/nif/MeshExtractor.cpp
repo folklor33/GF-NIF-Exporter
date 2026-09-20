@@ -1,5 +1,6 @@
 #include "nif/MeshExtractor.hpp"
 
+#include "nif/AnimationExtractor.hpp"
 #include "nif/HeaderNormalizer.hpp"
 #include "nif/MaterialExtractor.hpp"
 #include "nif/NameClassifier.hpp"
@@ -21,6 +22,7 @@
 
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -356,6 +358,29 @@ void WalkNode(Niflib::NiAVObject* obj,
 
 } // namespace
 
+bool ResolveCompanionKf(const std::string& nifPath, std::string& outKfPath) {
+    namespace fs = std::filesystem;
+    const fs::path nif(nifPath);
+
+    // "<type>/model/NAME.nif" -> "<type>/animation/NAME.kf": walk up from the
+    // file to its parent directory name, only proceeding when that parent is
+    // literally "model" (case-sensitive, matching the corpus) so a .nif that
+    // does not sit under a model/ directory is left alone rather than guessing.
+    const fs::path parent = nif.parent_path();
+    if (parent.filename() != "model") {
+        return false;
+    }
+    const fs::path candidate =
+        parent.parent_path() / "animation" / fs::path(nif.stem()).concat(".kf");
+
+    std::error_code ec;
+    if (!fs::exists(candidate, ec) || ec) {
+        return false;
+    }
+    outKfPath = candidate.string();
+    return true;
+}
+
 ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool verifyStrips) {
     ExtractionResult result;
     scene = SceneData();
@@ -450,6 +475,44 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
             result.error = "no geometry found (" + std::to_string(blocks.size()) + " blocks parsed)";
         }
         return result;
+    }
+
+    // Animation, after geometry/skinning has succeeded: embedded controllers
+    // are walked from the same set of unreferenced roots the mesh pass used
+    // (a file can carry embedded animation on a node with no skinned mesh
+    // under it at all), and the companion .kf, if any, is resolved by the
+    // <type>/model/NAME.nif <-> <type>/animation/NAME.kf convention.
+    //
+    // The skeleton used to resolve bone names is whichever one the mesh walk
+    // built -- scene.skeletons is a vector for format-generality (see
+    // SceneData), but every file in this corpus builds at most one, and
+    // SkeletonExtractor's own EnsureSkeleton already warns if a second root is
+    // ever named. A file with animation but no skin has no skeleton to resolve
+    // against; every track then comes back orphaned, which is exactly what
+    // "no skeleton in this file" should report as.
+    {
+        AnimationExtractor animExtractor(&result.warnings);
+        const SkeletonData* skeleton =
+            scene.skeletons.empty() ? nullptr : &scene.skeletons[0];
+
+        for (const NiObjectRef& b : blocks) {
+            NiObject* obj = static_cast<NiObject*>(b);
+            if (referenced.find(obj) != referenced.end()) {
+                continue;
+            }
+            if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
+                animExtractor.ExtractEmbedded(av, skeleton, scene, result.animation);
+            }
+        }
+
+        std::string kfPath;
+        if (ResolveCompanionKf(nifPath, kfPath)) {
+            ++result.animation.kfFilesFound;
+            if (!animExtractor.ExtractFromKf(kfPath, skeleton, scene, result.animation)) {
+                result.warnings.push_back("companion .kf '" + kfPath +
+                                          "' could not be parsed; its animations are missing");
+            }
+        }
     }
 
     result.success = true;

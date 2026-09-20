@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <title>gfmodel viewer</title>
 <!--
-  Throwaway Phase 2 validation viewer.
+  Throwaway validation viewer, grown across Phases 2-4.
 
   Not part of the Angular deliverable: this exists only to eyeball the exported
-  geometry, UVs and materials. Three.js comes from a CDN, everything else is
-  inline, and there is no build step.
+  geometry, UVs, materials, skinning and animation. Three.js comes from a CDN,
+  everything else is inline, and there is no build step.
 
   Serve the repo root over HTTP so the exported files and the input textures are
   both reachable, e.g.:
@@ -32,6 +32,12 @@
   .warn { color:#ffcc66; }
   .err  { color:#ff7b72; }
   .ok   { color:#7ee787; }
+  #animbar { position:fixed; top:46px; left:0; right:0; padding:8px 14px; background:#1d2027ee;
+             border-bottom:1px solid #2e333d; display:flex; gap:12px; align-items:center; z-index:10; }
+  #animbar select { background:#12141a; border:1px solid #333a45; color:#e6e8ee; padding:5px 8px;
+                    border-radius:4px; font-family:ui-monospace,monospace; max-width:40vw; }
+  #animbar input[type=range] { flex:1; }
+  #timeLabel { font-family:ui-monospace,monospace; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -47,6 +53,12 @@
   <label><input type="checkbox" id="zup" checked> Z-up &rarr; Y-up</label>
   <label><input type="checkbox" id="skel"> skeleton</label>
   <label><input type="checkbox" id="skin" checked> skinning</label>
+</div>
+<div id="animbar" style="display:none">
+  <select id="clipSelect"></select>
+  <button id="playPause">Pause</button>
+  <input type="range" id="timeline" min="0" max="1" step="0.001" value="0">
+  <span id="timeLabel">0.00 / 0.00</span>
 </div>
 <div id="stats">no model loaded</div>
 
@@ -95,15 +107,33 @@ scene.add(grid);
 let root = new THREE.Group();
 scene.add(root);
 
+// Animation playback state, rebuilt on every load. mixer is null when the
+// current model has no clips, which the UI reflects by hiding #animbar.
+let mixer = null;
+let activeAction = null;
+let currentClips = [];
+let scrubbing = false; // true while the timeline slider itself is being dragged
+
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
 
+const clock = new THREE.Clock();
+
 (function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  if (mixer && activeAction && activeAction.isRunning() && !scrubbing) {
+    mixer.update(clock.getDelta());
+    const t = activeAction.time % Math.max(activeAction.getClip().duration, 1e-6);
+    document.getElementById('timeline').value = t;
+    document.getElementById('timeLabel').textContent =
+      `${t.toFixed(2)} / ${activeAction.getClip().duration.toFixed(2)}`;
+  } else {
+    clock.getDelta(); // keep the clock from jumping when playback resumes
+  }
   renderer.render(scene, camera);
 })();
 
@@ -144,6 +174,52 @@ function buildBones(skel) {
     else bones[b.parent].add(bones[i]);
   });
   return { bones, roots };
+}
+
+// Reads one channel's {times, values} accessor pair straight out of the
+// shared .gfbin -- same pattern as attr()/attrU16() above, just without
+// wrapping the result in a BufferAttribute since THREE's *KeyframeTrack
+// constructors want plain typed arrays.
+function channelArrays(bin, ch) {
+  if (!ch || ch.count === 0) return null;
+  const times = new Float32Array(bin, ch.times.byteOffset, ch.count);
+  const values = new Float32Array(bin, ch.values.byteOffset, ch.count * ch.values.itemSize);
+  return { times, values };
+}
+
+// Builds one THREE.AnimationClip per exported AnimationClip, targeting bones
+// by name (".bones[boneName].quaternion" etc, THREE's standard skeletal
+// target path) so the same clip plays on any skeleton that has those bone
+// names -- exactly how the source .kf's own name-based binding works.
+// An orphaned track (boneIndex === -1, no matching bone in this file's
+// skeleton) is skipped: THREE.PropertyBinding would warn on every frame for a
+// path that resolves to nothing, so it is left out rather than passed through.
+function buildAnimationClips(model, bin) {
+  return (model.animations || []).map(clip => {
+    const tracks = [];
+    for (const t of clip.tracks) {
+      if (t.boneIndex < 0) continue;
+      const name = `.bones[${t.boneName}]`;
+
+      const rot = channelArrays(bin, t.rotation);
+      if (rot) tracks.push(new THREE.QuaternionKeyframeTrack(name + '.quaternion', rot.times, rot.values));
+
+      const trans = channelArrays(bin, t.translation);
+      if (trans) tracks.push(new THREE.VectorKeyframeTrack(name + '.position', trans.times, trans.values));
+
+      const scale = channelArrays(bin, t.scale);
+      if (scale) {
+        // Scale is stored as one float per key (uniform scale); THREE's
+        // VectorKeyframeTrack for .scale wants xyz triples, so it is expanded.
+        const expanded = new Float32Array(scale.values.length * 3);
+        for (let i = 0; i < scale.values.length; i++) {
+          expanded[i * 3] = expanded[i * 3 + 1] = expanded[i * 3 + 2] = scale.values[i];
+        }
+        tracks.push(new THREE.VectorKeyframeTrack(name + '.scale', scale.times, expanded));
+      }
+    }
+    return new THREE.AnimationClip(clip.name || clip.originFile, clip.durationSeconds, tracks);
+  });
 }
 
 function buildScene(model, bin, textureUrlFor) {
@@ -292,7 +368,9 @@ function buildScene(model, bin, textureUrlFor) {
   if (document.getElementById('zup').checked) {
     group.rotation.x = -Math.PI / 2;
   }
-  return { group, notes };
+
+  const clips = buildAnimationClips(model, bin);
+  return { group, notes, clips };
 }
 
 function frame(group) {
@@ -328,10 +406,15 @@ function show(model, bin, textureUrlFor) {
     if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
   });
 
-  const { group, notes } = buildScene(model, bin, textureUrlFor);
+  const { group, notes, clips } = buildScene(model, bin, textureUrlFor);
   root = group;
   scene.add(root);
   frame(root);
+
+  mixer = clips.length ? new THREE.AnimationMixer(root) : null;
+  activeAction = null;
+  currentClips = clips;
+  setupAnimBar(clips);
 
   const tris = model.meshes.reduce((a, m) => a + m.indexCount / 3, 0);
   const verts = model.meshes.reduce((a, m) => a + m.vertexCount, 0);
@@ -396,6 +479,59 @@ function loadFromFiles(fileList) {
   };
   fr.readAsText(modelFile);
 }
+
+// ------------------------------------------------------------- anim controls
+// Rebuilds the clip dropdown for a freshly loaded model and starts the first
+// clip playing, or hides the bar entirely when the model has none.
+function setupAnimBar(clips) {
+  const bar = document.getElementById('animbar');
+  const select = document.getElementById('clipSelect');
+  select.innerHTML = '';
+  if (!clips.length) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  clips.forEach((c, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${c.name} (${c.duration.toFixed(2)}s, ${c.tracks.length} tracks)`;
+    select.appendChild(opt);
+  });
+  playClip(0);
+}
+
+function playClip(index) {
+  if (activeAction) activeAction.stop();
+  const clip = currentClips[index];
+  document.getElementById('timeline').max = clip.duration;
+  document.getElementById('timeline').value = 0;
+  activeAction = mixer.clipAction(clip);
+  activeAction.reset().play();
+  document.getElementById('playPause').textContent = 'Pause';
+}
+
+document.getElementById('clipSelect').onchange = e => playClip(+e.target.value);
+
+document.getElementById('playPause').onclick = () => {
+  if (!activeAction) return;
+  activeAction.paused = !activeAction.paused;
+  document.getElementById('playPause').textContent = activeAction.paused ? 'Play' : 'Pause';
+};
+
+// While the user drags the slider, playback is paused and the mixer is
+// scrubbed directly (setTime), rather than fighting the animate loop's own
+// mixer.update -- see the `scrubbing` guard there.
+const timelineEl = document.getElementById('timeline');
+timelineEl.oninput = () => {
+  if (!activeAction) return;
+  scrubbing = true;
+  const t = +timelineEl.value;
+  mixer.setTime(t);
+  document.getElementById('timeLabel').textContent =
+    `${t.toFixed(2)} / ${activeAction.getClip().duration.toFixed(2)}`;
+};
+timelineEl.onchange = () => { scrubbing = false; };
 
 // ------------------------------------------------------------------- wiring
 const pathInput = document.getElementById('path');

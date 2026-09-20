@@ -178,6 +178,63 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         ranges.push_back(r);
     }
 
+    // Animation keyframes go in the same buffer, after every mesh's data --
+    // same principle as the mesh attributes: bulk numeric data lives in the
+    // .gfbin, addressed by byte offset from the .gfmodel JSON, so a consumer
+    // reads it straight into a typed array with no parsing.
+    //
+    // Each channel (translation/rotation/scale) of each track is stored as two
+    // parallel arrays: times (float32, one per key) and values (float32,
+    // 3 or 4 per key). Keeping times separate from values, rather than
+    // interleaving [time, x, y, z], lets a consumer binary-search the time
+    // array directly without a stride.
+    struct ChannelRange {
+        size_t timeOffset = 0, valueOffset = 0;
+        size_t count = 0;
+    };
+    struct TrackRanges {
+        ChannelRange translations, rotations, scales;
+    };
+    std::vector<std::vector<TrackRanges>> animRanges(scene.animations.size());
+
+    for (size_t ci = 0; ci < scene.animations.size(); ++ci) {
+        const AnimationClip& clip = scene.animations[ci];
+        animRanges[ci].resize(clip.tracks.size());
+        for (size_t ti = 0; ti < clip.tracks.size(); ++ti) {
+            const AnimationTrack& t = clip.tracks[ti];
+            TrackRanges& r = animRanges[ci][ti];
+            std::vector<float> scratch;
+
+            r.translations.count = t.translations.size();
+            scratch.clear();
+            for (const VectorKey& k : t.translations) scratch.push_back(k.time);
+            r.translations.timeOffset = AppendFloats(bin, scratch.data(), scratch.size());
+            scratch.clear();
+            for (const VectorKey& k : t.translations) {
+                scratch.insert(scratch.end(), {k.value[0], k.value[1], k.value[2]});
+            }
+            r.translations.valueOffset = AppendFloats(bin, scratch.data(), scratch.size());
+
+            r.rotations.count = t.rotations.size();
+            scratch.clear();
+            for (const QuatKey& k : t.rotations) scratch.push_back(k.time);
+            r.rotations.timeOffset = AppendFloats(bin, scratch.data(), scratch.size());
+            scratch.clear();
+            for (const QuatKey& k : t.rotations) {
+                scratch.insert(scratch.end(), {k.value[0], k.value[1], k.value[2], k.value[3]});
+            }
+            r.rotations.valueOffset = AppendFloats(bin, scratch.data(), scratch.size());
+
+            r.scales.count = t.scales.size();
+            scratch.clear();
+            for (const VectorKey& k : t.scales) scratch.push_back(k.time);
+            r.scales.timeOffset = AppendFloats(bin, scratch.data(), scratch.size());
+            scratch.clear();
+            for (const VectorKey& k : t.scales) scratch.push_back(k.value[0]);
+            r.scales.valueOffset = AppendFloats(bin, scratch.data(), scratch.size());
+        }
+    }
+
     {
         std::ofstream out(binPath, std::ios::binary);
         if (!out) {
@@ -195,7 +252,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::ostringstream js;
     js << "{\n";
     js << "  \"formatVersion\": " << kGfModelFormatVersion << ",\n";
-    js << "  \"generator\": \"gfnif-export (phase 3)\",\n";
+    js << "  \"generator\": \"gfnif-export (phase 4)\",\n";
     js << "  \"sourceNif\": \"" << JsonEscape(scene.sourceNifPath) << "\",\n";
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
@@ -313,10 +370,54 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     }
     js << "  ],\n";
 
-    // Reserved for later phases. Emitted as empty rather than omitted so the
+    // Each channel is {times: accessor, values: accessor, count}, empty
+    // (count 0) when the source did not animate that property -- a consumer
+    // keeps the bone's bind-pose value in that case. itemSize is baked into
+    // the accessor rather than stated separately: 3 for translation/scale, 4
+    // (quaternion xyzw) for rotation.
+    const auto channelJson = [](const char* indent, const ChannelRange& r, int itemSize) {
+        std::ostringstream out;
+        out << indent << "{\"count\": " << r.count << ", \"times\": {\"byteOffset\": "
+            << r.timeOffset << ", \"itemSize\": 1, \"count\": " << r.count
+            << ", \"type\": \"float32\"}, \"values\": {\"byteOffset\": " << r.valueOffset
+            << ", \"itemSize\": " << itemSize << ", \"count\": " << r.count
+            << ", \"type\": \"float32\"}}";
+        return out.str();
+    };
+
+    js << "  \"animations\": [\n";
+    for (size_t ci = 0; ci < scene.animations.size(); ++ci) {
+        const AnimationClip& clip = scene.animations[ci];
+        js << "    {\n";
+        js << "      \"name\": \"" << JsonEscape(clip.name) << "\",\n";
+        js << "      \"originFile\": \"" << JsonEscape(clip.originFile) << "\",\n";
+        js << "      \"durationSeconds\": " << Num(clip.durationSeconds) << ",\n";
+        js << "      \"wasResampledFromBSpline\": "
+           << (clip.wasResampledFromBSpline ? "true" : "false") << ",\n";
+        js << "      \"bSplineSampleRate\": " << Num(clip.bSplineSampleRate) << ",\n";
+        js << "      \"tracks\": [\n";
+        for (size_t ti = 0; ti < clip.tracks.size(); ++ti) {
+            const AnimationTrack& t = clip.tracks[ti];
+            const TrackRanges& r = animRanges[ci][ti];
+            js << "        {\n";
+            js << "          \"boneName\": \"" << JsonEscape(t.boneName) << "\",\n";
+            js << "          \"boneIndex\": " << t.boneIndex << ",\n";
+            js << "          \"translation\": " << channelJson("", r.translations, 3) << ",\n";
+            js << "          \"rotation\": " << channelJson("", r.rotations, 4) << ",\n";
+            // Scale is stored as a single float per key (uniform scale only --
+            // NiAVObject cannot even express non-uniform scale, see
+            // PHASE3_FINDINGS), not a 3-component vector like translation.
+            js << "          \"scale\": " << channelJson("", r.scales, 1) << "\n";
+            js << "        }" << (ti + 1 < clip.tracks.size() ? "," : "") << "\n";
+        }
+        js << "      ]\n";
+        js << "    }" << (ci + 1 < scene.animations.size() ? "," : "") << "\n";
+    }
+    js << "  ],\n";
+
+    // Reserved for a later phase. Emitted as empty rather than omitted so the
     // schema keeps its shape, but deliberately NOT pre-filled with a guessed
-    // structure -- phases 4 and 5 will define these.
-    js << "  \"animations\": [],\n";
+    // structure -- phase 5 will define this.
     js << "  \"particleSystems\": []\n";
     js << "}\n";
 

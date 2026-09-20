@@ -63,6 +63,17 @@ public:
     bool ApplySkin(Niflib::NiTriShape* shape, SceneData& scene, MeshData& mesh,
                    SkinningStats& stats);
 
+    /*! Index into scene.skeletons of the skeleton built for this file (via
+     *  EnsureSkeleton, itself reached through a skinned mesh's
+     *  NiSkinInstance), or -1 if the file has no skin at all. Phase 4 uses
+     *  this after the mesh walk to resolve animation tracks by bone name even
+     *  when no skinned mesh triggered the skeleton build -- see
+     *  AnimationExtractor. */
+    int SkeletonIndex() const { return skeletonIndex_; }
+
+    /*! The NiNode the skeleton was built from, or nullptr if none. */
+    Niflib::NiNode* SkeletonRoot() const { return skeletonRoot_; }
+
 private:
     /*! One bone influence on one vertex, before the 4-slot cap is applied. */
     struct Influence {

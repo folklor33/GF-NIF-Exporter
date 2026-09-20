@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -183,6 +184,13 @@ int RunExport(const std::vector<std::string>& args) {
     int filesWithSkeleton = 0, totalBones = 0, maxBones = 0, totalSkinsFailed = 0;
     int mixedSkinFiles = 0;
     gfnif::SkinningStats skinning;
+    gfnif::AnimationStats animStats;
+    int filesWithAnimation = 0;
+    size_t totalAnimationClips = 0, totalAnimationTracks = 0;
+    std::vector<float> clipDurations;
+    std::vector<int> tracksPerClip;
+    std::vector<int> animatedBonesPerClip;
+    std::map<std::string, int> orphanBoneNames;
     std::vector<std::string> failures;
     std::vector<std::string> unresolvedTextures;
 
@@ -255,6 +263,26 @@ int RunExport(const std::vector<std::string>& args) {
             }
         }
 
+        animStats.Merge(res.animation);
+        if (!scene.animations.empty()) {
+            ++filesWithAnimation;
+            totalAnimationClips += scene.animations.size();
+            for (const gfnif::AnimationClip& clip : scene.animations) {
+                totalAnimationTracks += clip.tracks.size();
+                clipDurations.push_back(clip.durationSeconds);
+                tracksPerClip.push_back(static_cast<int>(clip.tracks.size()));
+                int animatedBones = 0;
+                for (const gfnif::AnimationTrack& t : clip.tracks) {
+                    if (t.boneIndex >= 0) {
+                        ++animatedBones;
+                    } else {
+                        ++orphanBoneNames[t.boneName];
+                    }
+                }
+                animatedBonesPerClip.push_back(animatedBones);
+            }
+        }
+
         std::cout << "  -> " << outBase.string() << ".gfmodel/.gfbin\n";
         std::cout << "     " << scene.meshes.size() << " mesh(es), " << scene.materials.size()
                   << " material(s), " << scene.TotalVertices() << " verts, "
@@ -265,6 +293,9 @@ int RunExport(const std::vector<std::string>& args) {
         if (!scene.skeletons.empty()) {
             std::cout << ", " << scene.skeletons[0].bones.size() << " bones/"
                       << res.skinning.skinnedMeshes << " skinned";
+        }
+        if (!scene.animations.empty()) {
+            std::cout << ", " << scene.animations.size() << " animation clip(s)";
         }
         std::cout << "\n";
 
@@ -357,6 +388,75 @@ int RunExport(const std::vector<std::string>& args) {
     std::cout << "  partition < ours    : " << skinning.partitionWeightBelowOurs
               << " (max shortfall " << skinning.maxPartitionBelowDelta << ")\n";
     std::cout << "  max weight delta    : " << skinning.maxPartitionWeightDelta << "\n";
+
+    std::cout << "\n--- animation ---------------------------------------------------\n";
+    std::cout << "Files with animation: " << filesWithAnimation << "\n";
+    std::cout << "Animation clips     : " << totalAnimationClips << " (" << animStats.embeddedClips
+              << " embedded, " << animStats.kfClips << " from " << animStats.kfFilesFound
+              << " .kf file(s))\n";
+    std::cout << "Tracks              : " << totalAnimationTracks << " (" << animStats.classicTracks
+              << " classic keyframe, " << animStats.bSplineTracks << " B-spline resampled)\n";
+    std::cout << "ControllerLink rows : " << animStats.tracksTotal << " total, "
+              << animStats.tracksSkippedOutOfScope
+              << " out of scope (material/UV/visibility, not a bone transform), "
+              << animStats.tracksStaticPoseOnly
+              << " static pose only (no timeline for this clip), "
+              << animStats.tracksBSplineEmpty
+              << " B-spline with no channel data, "
+              << animStats.tracksFailed << " genuinely failed to extract\n";
+    std::cout << "Euler rotation      : " << animStats.tracksWithUnsupportedEulerRotation
+              << " classic track(s) used XYZ_ROTATION_KEY (rotation channel left empty)\n";
+    // Denominator is extracted bone tracks (classic + B-spline), not every
+    // ControllerLink row: out-of-scope rows (material/UV/visibility) were
+    // never bone tracks in the first place and have no bone to resolve.
+    const int extractedTracks = animStats.tracksResolved + animStats.tracksOrphaned;
+    std::cout << "Track resolution    : " << animStats.tracksResolved << "/" << extractedTracks;
+    if (extractedTracks > 0) {
+        std::cout << " (" << std::fixed << std::setprecision(2)
+                  << (100.0 * animStats.tracksResolved / extractedTracks) << "%)"
+                  << std::defaultfloat;
+    }
+    std::cout << " resolved to a skeleton bone, " << animStats.tracksOrphaned << " orphaned\n";
+    std::cout << "Scale animated      : " << animStats.tracksWithScaleAnimated << "/"
+              << extractedTracks << " track(s)\n";
+    std::cout << "Total keyframes     : " << animStats.totalKeyframesWritten << "\n";
+
+    if (!clipDurations.empty()) {
+        std::vector<float> sortedDur = clipDurations;
+        std::sort(sortedDur.begin(), sortedDur.end());
+        const auto pct = [&](double p) {
+            size_t idx = static_cast<size_t>(p * (sortedDur.size() - 1));
+            return sortedDur[idx];
+        };
+        double sumDur = 0.0;
+        for (float d : sortedDur) sumDur += d;
+        std::cout << "Clip duration (s)   : min " << sortedDur.front() << ", p50 " << pct(0.5)
+                  << ", p90 " << pct(0.9) << ", max " << sortedDur.back() << ", mean "
+                  << (sumDur / sortedDur.size()) << "\n";
+
+        std::vector<int> sortedTracks = tracksPerClip;
+        std::sort(sortedTracks.begin(), sortedTracks.end());
+        std::cout << "Tracks/clip         : min " << sortedTracks.front() << ", p50 "
+                  << sortedTracks[sortedTracks.size() / 2] << ", max " << sortedTracks.back()
+                  << "\n";
+
+        std::vector<int> sortedBones = animatedBonesPerClip;
+        std::sort(sortedBones.begin(), sortedBones.end());
+        std::cout << "Animated bones/clip : min " << sortedBones.front() << ", p50 "
+                  << sortedBones[sortedBones.size() / 2] << ", max " << sortedBones.back() << "\n";
+    }
+
+    if (!orphanBoneNames.empty()) {
+        std::vector<std::pair<std::string, int>> orphans(orphanBoneNames.begin(),
+                                                          orphanBoneNames.end());
+        std::sort(orphans.begin(), orphans.end(),
+                 [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::cout << "Most frequent orphaned track names (" << orphans.size()
+                  << " distinct):\n";
+        for (size_t i = 0; i < orphans.size() && i < 15; ++i) {
+            std::cout << "  " << orphans[i].second << "x  \"" << orphans[i].first << "\"\n";
+        }
+    }
 
     const int texTotal = texturesResolved + texturesMissing;
     std::cout << "Textures resolved : " << texturesResolved << "/" << texTotal;
