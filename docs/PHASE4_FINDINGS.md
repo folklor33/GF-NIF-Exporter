@@ -1283,6 +1283,131 @@ committed. `tools/nif_to_obj.py` itself needs a `bpy.ops.export_scene.obj` ->
 `bpy.ops.wm.obj_export` port to run on Blender 5.2+ (noted, not fixed this
 session since a scratch patch was sufficient for this investigation).
 
+## 16. `compare_bind_pose.js` was itself broken — position check never actually compared positions
+
+Follow-up to §14.4's still-tilted `M009` and a newly-reported `M069` with the
+same visual symptom (body flipped relative to limbs/pincers — a crab model
+where the torso and the legs/claws disagree). Before touching
+`ReconstructBindPoseFromSkin` (§14.2) again, `tools/diag/compare_bind_pose.js`
+was extended to catch this specific shape of defect and then, per this
+project's standing discipline, tested against a known-broken case before
+being trusted for anything.
+
+**Two real bugs found in the harness itself, both pre-dating this session:**
+
+1. **Flat-array row/column swap.** `columnMajorFlatToRowsCols` read
+   `flat[col*4+row]` (true glTF column-major), but `SkeletonExtractor.cpp`'s
+   `ToColumnMajor` actually writes `flat[row*4+col]` (row-major, despite the
+   function's own name and doc comment) — confirmed by hand against niflib's
+   `Matrix44::GetTranslation()`, which reads `m[3][0..2]`, and directly on a
+   real bone (`M389`'s `Bip01`: translation `(-1.6e-8, -0.333, 0.912)` sits at
+   `flat[12..15]`, which is exactly `flat[row*4+col]` for `row=3`, and would
+   NOT land there under true column-major indexing). This transposed every
+   matrix silently.
+2. **Blender/exporter convention mismatch never corrected.** Blender's
+   `bone.matrix_local` (dumped by `dump_bone_bind_pose.py`) is a
+   COLUMN-VECTOR-convention matrix (translation in the last *column*); this
+   exporter's `bindMatrixLocal` is ROW-VECTOR-convention (translation in the
+   last *row*) throughout, per every other comment in this codebase. The two
+   were never reconciled — the reference matrices needed one transpose after
+   loading, which the harness never did.
+
+**Combined effect: `translationOf` read all-near-zero garbage on both sides
+for every bone, in every file, since the day this harness was written** — so
+its position check always reported "off by 0.0000" regardless of whether
+positions actually agreed. Every prior verdict from this tool (including the
+ones that called `M017`/`M389` correct in §14.1/14.2) was comparing noise to
+noise, not real data. Position agreement in those sections was established by
+other means (visual re-render, direct hand comparison against
+`blender_niftools_addon` to 3 decimal places) and stands; only this
+particular script's own historical verdicts are invalidated.
+
+**Both bugs confirmed by hand** on real matrices before being fixed (not just
+inferred from the symptom) — see the fix commit's diff for the worked
+arithmetic. After fixing them, position agreement on `M009`/`M069`/`M389`
+became genuinely close (sub-0.01 on nearly every bone), which is the expected
+result for files whose skin math was already independently verified correct
+in §14.1.
+
+**A third attempted addition — comparing each bone's ABSOLUTE world
+rotation — was tried and dropped.** The theory was that
+`blender_niftools_addon`'s import applies one constant, global change of
+basis relative to this exporter's native frame, correctable once per file
+from a single anchor bone. Checked by computing the ref→export rotation
+correction independently for several bones on the same file (`M009`): `Bip01`
+showed one 120-degree axis permutation, `Bip01 Pelvis`/`Bip01 Spine` a
+different permutation, `Bip01 L Thigh`/`Bip01 L Calf` a near-identity — not
+the same matrix, so no single global correction exists, and every version of
+this check produced large false-positive rates even on `M389` (already known
+correct). Dropped in favor of a check that needs no such correction:
+
+**Kept: RELATIVE rotation between specific bone pairs** known to straddle a
+prior suspected tear boundary (`Bip01 Pelvis`↔`Bip01 Spine`,
+`Bip01 Spine`↔thigh, hand↔`Finger1`, `Bip01 Pelvis`↔`Bip01 Tail`). This
+cancels any per-branch orientation-convention difference by construction (no
+correction estimate needed) and is exactly what catches "two groups each
+individually close to their own reference bone, but twisted relative to each
+other" — the actual M009/M069 symptom. Verified against a synthetic
+self-test (`--self-test`) that reproduces this exact failure shape (two rigid
+bone groups, positions identical to reference, one group rotated 90 degrees
+relative to the other) and asserts the position-only check would have missed
+it (0 position mismatches) while the assembly-coherence check catches it.
+
+**A/B result, with the fixed harness, on `M009`/`M069`/`M389`:** the current
+`ReconstructBindPoseFromSkin` behavior (implied bones trust the skin; a
+non-implied bone inherits its world transform from its own already-corrected
+parent) verdicts **OK** on all three files — zero position mismatches, zero
+assembly incoherence. A `NONE` variant (ignore all skin-implied corrections,
+trust the raw `NiNode` hierarchy alone, i.e. revert §14.2 entirely) fails
+badly on `M009` and `M069` (64/70 and 74/79 bones over position tolerance,
+real assembly incoherence of 20-60 degrees) and is only barely acceptable on
+`M389` (1 bone marginally over tolerance).
+
+**Conclusion: `ReconstructBindPoseFromSkin`'s existing behavior is already
+correct on these three files at bind pose.** The originally-suspected
+"partial reconstruction tears the skeleton" hypothesis — motivated by a
+corpus-wide measurement showing every file that reaches this function at all
+(1448/2825, essentially every skinned file) mixes implied and non-implied
+bones, never 100%-implied or 0%-implied — does not hold once measured
+correctly: the code already re-anchors non-implied bones under their nearest
+implied ancestor (`correctedWorld[parent]`), so correction already propagates
+through a chain of non-implied bones once any ancestor is implied. This is
+the "derive ungrounded bones from their reconstructed parent" fallback the
+partial-reconstruction concern called for — it was already there.
+
+**Still open: `M009`/`M069` are visually reported as deformed (crab body vs.
+limbs) in the actual browser viewer, static bind pose.** Since the bind-pose
+skeleton itself now measures correct, the next lead is elsewhere —
+most likely animation (a clip moving the rig away from a correct rest pose
+into an incorrect posed state), not the static rest skeleton. Not
+investigated this session; see §14.4's own note that a from-scratch
+animation reconstruction broke on both a known-good and a known-bad `M009`
+clip, suggesting the B-spline sampling path is a more likely next target than
+`ReconstructBindPoseFromSkin`.
+
+**Corpus-wide measurement, for reference:** 1448 of 2825 `.nif` files reach
+`ReconstructBindPoseFromSkin` with at least one skin-implied bone; every
+single one of them mixes implied and non-implied bones (0 are 100%-implied,
+0 are 0%-implied) — implied-bone fraction ranges from 1% to 89% of the
+skeleton, median 57%. This confirms the mixed pattern is the norm, not an
+edge case, which is exactly why getting this function's correctness right
+(and getting the *harness* that checks it right) matters broadly, even
+though this session's A/B result clears the function's current behavior.
+
+### 16.1 Reproducing
+
+```
+tools\diag\compare_bind_pose.js --self-test   # verify the harness itself catches the M009-shaped tear
+tools\diag\run_bindpose_harness.sh <gfmodel_out_dir> [json_out_path]
+```
+
+The corpus-wide partial-reconstruction tally and the A/B mode comparison used
+temporary instrumentation in `SkeletonExtractor.cpp` (an env-var-gated trace
+and an env-var-gated `NONE` mode), same throwaway-diagnostic convention as
+every other one-off measurement in this project — not committed, source not
+kept since the change was small enough to redo from this section's
+description if needed again.
+
 ---
 
 ## 15. Reproducing (Phase 4 overall)
