@@ -238,22 +238,6 @@ bool SkeletonExtractor::ApplySkin(Niflib::NiTriShape* shape, SceneData& scene, M
         ToColumnMajor(skinData->GetBoneTransform(static_cast<unsigned int>(b)) * boneWorld,
                       binding.skinMatrix);
 
-        // Recorded for ReconstructBindPoseFromSkin: the world bind pose this
-        // skin's own data implies for this bone, independent of whatever the
-        // NiNode hierarchy's local transforms say (see that method's doc
-        // comment). Row-vector convention: apply boneOffset's inverse first,
-        // then the geometry's own world placement -- matches
-        // blender_niftools_addon's get_skin_bind() exactly (bind =
-        // boneOffset^-1 * geomWorld). First skin to weight a bone wins; a
-        // later, disagreeing skin is exactly what boneSkinMatrixConflicts
-        // below already measures, so this reuses that same precedent rather
-        // than picking a new tie-break rule.
-        if (impliedBoneWorldBind_.find(binding.boneIndex) == impliedBoneWorldBind_.end()) {
-            const Matrix44 boneOffset = skinData->GetBoneTransform(static_cast<unsigned int>(b));
-            const Matrix44 geomWorld = shape->GetWorldTransform();
-            impliedBoneWorldBind_[binding.boneIndex] = boneOffset.Inverse() * geomWorld;
-        }
-
         // Still measured, purely to document how often the per-skin transform
         // actually diverges (see PHASE3_FINDINGS).
         for (const SkinBinding& prior : priorBindings_) {
@@ -646,42 +630,6 @@ void SkeletonExtractor::VerifyAgainstPartition(Niflib::NiSkinInstance* skin, con
                 }
             }
         }
-    }
-}
-
-void SkeletonExtractor::ReconstructBindPoseFromSkin(SceneData& scene) {
-    if (skeletonIndex_ < 0 || impliedBoneWorldBind_.empty()) {
-        return;
-    }
-    SkeletonData& skeleton = scene.skeletons[skeletonIndex_];
-
-    // Parent-before-child (CollectBones' own emission order, unchanged since),
-    // so a bone's corrected parent world is always ready before this reaches
-    // the bone itself.
-    std::vector<Matrix44> correctedWorld(skeleton.bones.size());
-    for (size_t i = 0; i < skeleton.bones.size(); ++i) {
-        BoneData& bone = skeleton.bones[i];
-        const int parent = bone.parentIndex;
-        const Matrix44 parentWorld = (parent >= 0) ? correctedWorld[parent] : Matrix44::IDENTITY;
-
-        auto implied = impliedBoneWorldBind_.find(static_cast<int>(i));
-        Matrix44 world;
-        if (implied != impliedBoneWorldBind_.end()) {
-            // This bone was actually weighted by a skin: trust what the skin's
-            // own bind data implies over the NiNode's stored local transform.
-            world = implied->second;
-        } else {
-            // No skin ever weighted this bone directly (an intermediate/helper
-            // node, or a leaf past the last weighted bone) -- keep its
-            // authored local transform, but re-anchor it under the corrected
-            // parent chain so the hierarchy does not tear at the boundary
-            // between corrected and uncorrected bones.
-            world = FromColumnMajor(bone.bindMatrixLocal) * parentWorld;
-        }
-        correctedWorld[i] = world;
-
-        const Matrix44 local = world * parentWorld.Inverse();
-        ToColumnMajor(local, bone.bindMatrixLocal);
     }
 }
 

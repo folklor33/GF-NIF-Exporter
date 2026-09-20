@@ -472,14 +472,6 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
 
     result.skinning.skeletons = static_cast<int>(scene.skeletons.size());
 
-    // Every skinned shape's ApplySkin call above has now recorded what its
-    // own skin data implies about each bone's bind pose; correct the
-    // exported skeleton's bindMatrixLocal to match before anything (the
-    // animation pass below, or the caller) reads it. See
-    // ReconstructBindPoseFromSkin's doc comment for why the NiNode
-    // hierarchy's own transform is not trusted as-is.
-    skeletons.ReconstructBindPoseFromSkin(scene);
-
     if (scene.meshes.empty()) {
         // Distinguish "every shape was explicitly hidden by the source file"
         // from a genuinely empty/malformed file: the former is a real

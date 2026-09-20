@@ -1410,6 +1410,315 @@ description if needed again.
 
 ---
 
+## 17. `ReconstructBindPoseFromSkin` removed — user-confirmed root cause was the fix itself
+
+Follow-up to §16's own "still open" note. The lead there was wrong: this was
+never an animation-data or B-spline-sampling problem. It was
+`ReconstructBindPoseFromSkin` (§14.2) itself, confirmed by three independent
+lines of evidence in this session, plus direct user confirmation of the
+pre-fix behavior.
+
+**User-supplied ground truth, decisive**: `monster/M009`'s crab was NOT
+deformed in the original Phase 4 commit (`a69cf500`); the demembering
+appeared only after later work on animation/orientation. Manually deleting
+the `animations` array from the exported `.gfmodel` JSON made the deformity
+go away — confirming the defect only manifests once a clip actually plays,
+narrowing the search to the animation path (which is what motivated this
+session's initial, wrong lead into B-spline sampling).
+
+**Independent-pipeline replay (the check that actually mattered)**:
+`blender_niftools_addon`'s own `import_scene.kf` operator, run headless on
+`M009.nif` + `M009.kf` with no code shared with this exporter at all,
+reproduced the *exact same* demembered pose at every sampled frame of
+`move51`. Confirmed this was not a Three.js/viewer bug and not this
+exporter's `AnimationExtractor`/B-spline path: two completely independent
+codebases compute the same broken pose from the same source data, so the
+defect (at that point still assumed to be in the source `.kf`/`.nif` itself)
+had to be upstream of both.
+
+**The actual discriminator — bisecting against the original commit**: built
+`gfnif-export` from `a69cf500` in a separate git worktree (`niflib`'s own
+`qhull` submodule needs network access unavailable in this environment, but
+this project's own `CMakeLists.txt` already excludes `nifqhull.cpp` and
+stubs it, so this doesn't block the build). Exported `M009` and `M017` with
+that original binary and diffed the result against current `HEAD`:
+
+- `move51`'s `Bip01 NonAccum` animation track (the one with real per-frame
+  translation+rotation data) is **byte-identical** between the original
+  commit and now — animation extraction never changed for this bone.
+- `Bip01 Pelvis`'s **bind pose** (`bindMatrixLocal`) is completely
+  different: near-identity rotation in the original commit, a ~60-degree
+  tilt now. Same story for `Bip01 L Finger1` and `Bip01 Tail`. This is
+  exactly `ReconstructBindPoseFromSkin`, introduced after `a69cf500`.
+
+Since animation tracks are authored as deltas composed against a bone's rest
+pose, and the rest pose changed while the deltas did not, any composition —
+by this exporter, by Three.js, or by `blender_niftools_addon`'s identical
+`rest_rot_inv @ key_matrix` mechanism (`nif_import/animation/transform.py`)
+— now lands somewhere the original animator never intended. This also
+retroactively explains why the independent-pipeline replay agreed with this
+exporter: both apply the same *kind* of bind-pose correction (skin-implied
+over NiNode), so both broke together, not because Blender is proof of a
+source-data defect.
+
+**User-driven visual A/B, decisive**: re-added a temporary env-var switch to
+`ReconstructBindPoseFromSkin` (current skin-implied behavior vs. pure raw
+`NiNode`, i.e. reverting the fix), exported both variants of `M009` (the
+crab) and `M017` (the crocodile — the file that originally motivated the
+fix, per §14.1/14.2), and had the user load all four into the actual viewer
+and judge by eye. Result:
+
+- `M009`: skin-implied → demembered/broken. Raw `NiNode` → correct, not
+  deformed.
+- `M017`: skin-implied → upside-down. Raw `NiNode` → **also** upside-down,
+  identical in both modes.
+
+This is the finding that settled it: `ReconstructBindPoseFromSkin` does not
+actually fix `M017`'s reported problem (upside-down in both modes, unchanged
+by the fix) while it does break `M009`. Its net value on the two files that
+motivated and exercised it is negative. (`M017`'s upside-down orientation is
+a separate, already-known defect — not the "lying flattened on its side"
+symptom §14.2 originally described being fixed, and not addressed here.)
+
+**Fix: removed `ReconstructBindPoseFromSkin` entirely** — the method, its
+call site in `MeshExtractor::ExtractScene`, and the `impliedBoneWorldBind_`
+bookkeeping in `SkeletonExtractor` that only existed to feed it. Bind pose
+is once again taken directly from each bone's own `NiNode` local transform,
+as before §14.2. Verified: full corpus re-export unchanged in shape (same
+2822/2825 conversion rate, same 3 permanent failures, same skeleton/skinning
+corpus totals as every prior pass — only `bindMatrixLocal` values differ on
+the previously-"corrected" files).
+
+**`compare_bind_pose.js`'s own limitation, found by this revert**: reverting
+to raw `NiNode` made the harness verdict nearly every `monster/*` sample as
+`BONE_POSITION_MISMATCH` against its Blender reference — including `M009`
+itself, despite the user's direct visual confirmation that raw `NiNode` is
+the visually correct choice there. Reason: `blender_niftools_addon`'s own
+importer runs the identical style of skin-implied bind-pose correction on
+import (`store_bind_matrices()` / `get_object_bind()` in its `utils/math.py`
+and `nif_import/animation/transform.py`, confirmed by reading that source
+directly), so the harness's reference is not a raw `NiNode` rest pose either
+— it structurally prefers whichever exported bind pose already agrees with
+a skin-implied correction, which is exactly the choice in question. This
+harness cannot arbitrate between raw-`NiNode` and skin-implied bind poses;
+it can only check whether the exporter agrees with Blender's own (already
+skin-corrected) opinion. Documented directly in the script (see its own
+updated doc comment) so a future session does not re-trust an `OK` verdict
+from it for this specific question. The position/assembly-coherence checks
+both remain valid and correctly-verified for their original purpose (catching
+a torn/incoherent skeleton, which this bug was not).
+
+**Open, deliberately not re-investigated this session**: whatever genuinely
+motivated `ReconstructBindPoseFromSkin` on `M017` originally (a real
+NiNode/skin disagreement, corpus-measured at 479 files in §14.2) is still
+unresolved — `M017` is upside-down in both modes now. That is a distinct,
+narrower defect (global orientation, not a torn skeleton) from the one this
+section fixes, and needs its own investigation before any future attempt to
+reintroduce a skin-based bind-pose correction.
+
+### 17.1 Reproducing
+
+```
+git worktree add <path> a69cf500        # original Phase 4 commit, for bisecting
+git -C <path> submodule update --init external/niflib   # qhull's own nested
+                                                          # submodule will fail
+                                                          # over the network;
+                                                          # harmless, this
+                                                          # project's own
+                                                          # CMakeLists.txt
+                                                          # already excludes it
+cmake -S <path> -B <path>/build -A x64
+# build gfnif-export, export monster/M009.nif and monster/M017.nif, diff
+# bindMatrixLocal and animation track bytes against a current-HEAD export of
+# the same files
+```
+
+Blender-side independent replay used a scratch script (not committed):
+`bpy.ops.import_scene.nif(..., animation=False, ...)` followed by
+`bpy.ops.import_scene.kf(filepath=<kf>, files=[{"name": <kf_basename>}],
+scale_correction=1.0)` (the `.kf` operator only accepts `files`+`filepath`,
+not `directory`/`axis_forward`/`axis_up` — those live on the `.nif` importer
+and the scene's axis convention carries over). Render via
+`BLENDER_WORKBENCH`, camera auto-framed from mesh bounding boxes, target
+action selected explicitly (`armature.animation_data.action = bpy.data.actions[name]`)
+rather than trusting whichever action Blender leaves active after import.
+
+---
+
+## 18. Phase 4 closure
+
+Browser-verified after §17's fix (removal of `ReconstructBindPoseFromSkin`).
+This section is written to stand on its own for a future session with no
+memory of this one — see §18.5 for the method lesson that applies beyond
+Phase 4.
+
+### 18.1 Root cause of the demembering, in one paragraph
+
+A Gamebryo `.kf`'s keyframe values are deltas, authored and meant to be
+composed against one specific rest pose: the file's own raw `NiNode` local
+transforms, exactly as `blender_niftools_addon`'s
+`nif_import/animation/transform.py` composes them (`rest_rot_inv @
+key_matrix`, using the bind pose captured before any correction). §14.2's
+`ReconstructBindPoseFromSkin` replaced that rest pose, for every bone a skin
+actually weighted, with a different value implied by the skin's own bind
+data — changing the rest pose while leaving every existing animation track's
+deltas unchanged. Composing unchanged deltas against a changed rest pose
+lands wherever the arithmetic takes it, not wherever the original animator
+intended; on `monster/M009` and `monster/M069` this tore the skeleton into
+disconnected-looking pieces once a clip played (bind pose alone stayed
+correct, because nothing about a static rest pose depends on animation
+deltas — this is why the defect was invisible until §16 onward specifically
+went looking at animated poses, not bind pose).
+
+### 18.2 Why `ReconstructBindPoseFromSkin` was removed, and why not to reintroduce it alone
+
+Removed entirely in §17 (method, its `impliedBoneWorldBind_` bookkeeping in
+`SkeletonExtractor`, and its call site in `MeshExtractor::ExtractScene`).
+Confirmed by the user directly in the browser: with it removed, `M009` and
+`M069` animate correctly, and `M017` (the file that had originally motivated
+the fix) is no better or worse than before — still upside-down in both
+modes, so the fix was not actually fixing what it was believed to fix.
+
+**Do not reintroduce a skin-implied bind-pose correction without also
+reconciling every existing animation track against whatever new rest pose it
+produces.** The `NiNode` vs. skin disagreement that motivated §14.2 is real
+and still corpus-measured (479 files) — the mistake was correcting the rest
+pose in isolation while assuming animation tracks would keep composing
+correctly against it. Any future attempt needs one of:
+- Re-deriving each animation track's deltas against the NEW rest pose at
+  export time (not just at read time), so old deltas and new rest pose
+  agree again, or
+- Applying the correction only to files/bones verified to have no existing
+  animation depending on the old rest pose, or
+- A different fix entirely for whatever `M017`'s real defect turns out to be
+  (still open, see §18.4).
+
+### 18.3 `compare_bind_pose.js`'s structural blind spot on this question
+
+Documented directly in the script's own header comment (kept there
+deliberately, not just here, so it surfaces to whoever next reads or extends
+that file). Summary: the harness's reference bind pose comes from
+`blender_niftools_addon`'s own NIF importer, which applies the *same style*
+of skin-implied correction this section removed
+(`store_bind_matrices()`/`get_object_bind()` in that addon's own source).
+This harness can therefore only ever confirm "does the export's bind pose
+agree with a skin-corrected opinion" — it cannot tell you whether
+skin-correction was the right choice for a given file in the first place,
+because its reference already assumes the answer is yes. Concretely: after
+this section's revert, the harness verdicted nearly every `monster/*` sample
+as `BONE_POSITION_MISMATCH`, `M009` included, despite `M009`'s animation
+being directly confirmed correct in the browser. Do not use this harness's
+position/rotation verdict to decide between a raw-`NiNode` and a
+skin-implied bind pose on any future file — it is not built to answer that
+question. It remains valid for its original purpose: catching a torn or
+internally-incoherent skeleton (its assembly-coherence check, §16), which is
+a different question this bug did not actually involve.
+
+### 18.4 Known, accepted residual defects (technical debt, not blockers)
+
+Both confirmed by the user directly in the browser, after §17's fix, with
+both bind-pose modes tested where relevant. Neither affects animation
+correctness. Not investigated further this session — listed here so a
+future session does not have to rediscover them from scratch.
+
+- **`monster/M389`**: sits slightly elevated above the ground plane.
+  Correctly oriented, correctly animated. Cause not investigated (candidate:
+  a root-bone offset or ground-contact convention this exporter does not
+  currently correct for — separate from anything in this section).
+- **`monster/M017`** (the crocodile): upside-down, in BOTH the skin-implied
+  and raw-`NiNode` bind-pose modes — confirmed identical in both during
+  §17's A/B test. Not deformed, correctly animated. This directly disproves
+  the working assumption at the time `ReconstructBindPoseFromSkin` was
+  written (§14.1/14.2), which believed fixing the `NiNode`/skin disagreement
+  would fix `M017`'s orientation — it does not, in either direction. Whatever
+  actually causes `M017`'s upside-down orientation is a different, still-open
+  defect (global root orientation, most likely — see §14's own
+  root-transform investigation notes for prior related work), not the
+  skeleton-tearing bug this section fixes. Do not assume fixing this defect
+  means reintroducing `ReconstructBindPoseFromSkin`; the A/B test directly
+  showed that specific fix does not touch it.
+
+### 18.5 `item/WA85` — re-checked, confirmed working (not a residual defect)
+
+§14.3 fixed animated-mesh reattachment (`nodeIndex`) and verified it
+corpus-wide by data shape (1397 meshes across 265 files gained the expected
+`nodeIndex`), but never got a browser-confirmed "it visibly moves" check for
+`WA85` itself. This session did that check directly (Playwright driving the
+real viewer, not a from-scratch reconstruction — see §14.4's own warning
+about why a parallel reimplementation is the wrong way to check this) and
+initially got the same "nothing visibly moves" report the user had. Isolated
+by reading actual bone/node quaternions and world positions before and after
+scrubbing the timeline:
+
+- The two animated planes' (`Plane04`/`Plane03`) quaternions DO change
+  correctly when the mixer is scrubbed, and the reattached meshes ARE
+  correctly parented under them in the THREE.js scene graph
+  (`sceneNodeObjs.objs[nodeIndex]`, confirmed against the actual exported
+  `nodeIndex` values) — the export and viewer pipeline is working as
+  designed.
+- The reason nothing appeared to move: each plane's world POSITION sits
+  very close to its own rotation axis, so a symmetric glow-ring mesh
+  rotating in place produces almost no visible silhouette change — combined
+  with only 2 rotation keyframes spanning the full 1.5s clip (confirmed
+  directly in the exported data), the rotation is slow enough that a human
+  watching for a few seconds, or comparing two screenshots, can easily miss
+  it. The user confirmed directly: watching longer, the rotation IS visible,
+  just very slow.
+- **Not fully closed**: this confirms the exporter/viewer pipeline is
+  faithfully reproducing the source `.kf`'s 2 keyframes over 1.5 seconds —
+  it does NOT confirm that 2 keyframes over 1.5s is the speed the original
+  game actually renders this effect at. If a future session has access to
+  the original game (or another independent reference) and can compare
+  playback speed, that is the remaining open question for `WA85` — not
+  pipeline correctness, which this session did verify directly.
+
+**Method note for verifying "no visible motion" reports in general** (this
+almost produced a false "still broken" conclusion here): a single screenshot
+comparison, or a short glance at a slow/subtle animation, is not sufficient
+evidence of a broken pipeline. Read the actual keyframe count and duration
+from the exported data first (`node -e` against the `.gfmodel` JSON is
+enough — see this section's own commands), and check bone/node world
+transforms directly (Playwright + a temporary `window.__debug` hook exposing
+the viewer's module-scoped `root`/`mixer`, same technique as §17's A/B
+verification) before concluding the pipeline itself is at fault.
+
+### 18.6 Method lesson for future phases
+
+The single most useful thing learned across §16-§18: **static analysis and
+the exporter's own internal self-checks (invariants, corpus-wide statistics,
+numeric self-checks of hand-derived formulas) cannot catch a defect that is
+applied consistently everywhere the check looks.** Every genuinely decisive
+result in this arc came from an empirical, end-to-end test:
+- The user's own manual test (deleting the `animations` array from an
+  exported `.gfmodel` JSON) that first localized the defect to animation,
+  not bind pose.
+- An independent second pipeline (`blender_niftools_addon`'s own `.kf`
+  importer, run headless) replaying the same source data end to end.
+- Bisecting to the original commit and diffing actual exported bytes,
+  rather than reasoning about what the code "should" produce.
+- A direct visual A/B test of competing implementations, judged by the user
+  in the actual viewer — not by a harness, however well-tested that harness's
+  own self-test suite is (§16's harness was internally self-consistent and
+  passed its own synthetic self-test the whole time; it was still the wrong
+  arbiter for this specific question, per §18.3).
+
+For Phase 5 (particles): prefer writing a small script that actually loads
+the exported output in the real viewer/consumer and checks the result
+end-to-end (Playwright + a temporary debug hook is enough, no need for a
+polished harness for a one-off check) over trusting corpus-wide statistics
+or self-consistency checks alone, whenever a symptom is reported that a
+self-check does not reproduce.
+
+### 18.7 Branch/commit disposition
+
+This phase's work landed on `phase4-followup-wip`, branched from `main`.
+See the git log for the commit that carries this closure and §17's fix; it
+was merged/rebased onto `main` as part of closing this phase (check `git
+log main` if this note is stale by the time you read it — the intent was a
+clean, readable history on `main`, not a preserved WIP trail).
+
+---
+
 ## 15. Reproducing (Phase 4 overall)
 
 ```

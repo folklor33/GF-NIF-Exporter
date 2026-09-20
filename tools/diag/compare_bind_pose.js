@@ -41,6 +41,24 @@
 // Comparing bone positions directly, independent of any mesh or animation,
 // is the only way to catch this without actually replaying a clip.
 //
+// KNOWN LIMITATION, found the hard way (see PHASE4_FINDINGS §16/17):
+// blender_niftools_addon's reference is NOT a raw NiNode rest pose --
+// store_bind_matrices() applies its own skin-implied correction on import,
+// same idea as this exporter's (removed) ReconstructBindPoseFromSkin. So this
+// harness structurally prefers whichever bindMatrixLocal matches a
+// skin-corrected rest pose, and will verdict a genuinely-correct raw-NiNode
+// export as a mismatch -- confirmed directly: reverting to raw NiNode (after
+// A/B testing in the actual viewer showed it was the visually correct choice
+// for monster/M009's animations) made this harness fail on nearly every
+// monster/* sample, M009 included, despite the animated result being
+// visibly correct. Do not trust an "OK"/"MISMATCH" verdict from this harness
+// alone to decide between a raw-NiNode and a skin-implied bind pose -- it
+// can only tell you whether the export agrees with blender_niftools_addon's
+// OWN (already-corrected) opinion, which is exactly the thing in question.
+// A real per-file decision needs the animated-clip visual check (or
+// equivalent independent-pipeline replay) this session ended up doing by
+// hand, not this harness.
+//
 // Usage:
 //   node compare_bind_pose.js <bone_json_dir> <gfmodel_dir>
 //
