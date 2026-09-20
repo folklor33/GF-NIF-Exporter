@@ -351,9 +351,12 @@ struct AnimationStats {
      *  phase only extracts bone transforms. */
     int tracksSkippedOutOfScope = 0;
     /*! Classic tracks whose rotation channel used XYZ_ROTATION_KEY (separate
-     *  Euler sub-channels) rather than quaternion keys. Translation/scale
-     *  still extract; only the rotation channel is left empty. Counted here
-     *  so its corpus prevalence is visible without grepping warnings. */
+     *  Euler sub-channels) rather than quaternion keys -- composed into a
+     *  regular quaternion timeline by ExtractXyzRotation (see
+     *  AnimationExtractor.cpp's ComposeXyzEuler for the composition order and
+     *  its justification). Counted here so its corpus prevalence (68.0% of
+     *  classic tracks, PHASE4_FINDINGS §3.1) is visible without grepping
+     *  warnings, not because it is still a gap. */
     int tracksWithUnsupportedEulerRotation = 0;
     /*! NiTransformInterpolator links whose GetData() is null -- the bone has a
      *  static pose value for this clip (see NiTransformInterpolator's own

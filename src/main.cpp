@@ -405,7 +405,7 @@ int RunExport(const std::vector<std::string>& args) {
               << " B-spline with no channel data, "
               << animStats.tracksFailed << " genuinely failed to extract\n";
     std::cout << "Euler rotation      : " << animStats.tracksWithUnsupportedEulerRotation
-              << " classic track(s) used XYZ_ROTATION_KEY (rotation channel left empty)\n";
+              << " classic track(s) used XYZ_ROTATION_KEY (composed into quaternion keys)\n";
     // Denominator is extracted bone tracks (classic + B-spline), not every
     // ControllerLink row: out-of-scope rows (material/UV/visibility) were
     // never bone tracks in the first place and have no bone to resolve.

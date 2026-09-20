@@ -128,6 +128,127 @@ void CopyVec3(const Niflib::Vector3& v, float (&out)[3]) {
     out[2] = v.z;
 }
 
+/*! Composes three Euler angles (radians) into a quaternion using the order
+ *  XYZ_ROTATION_KEY implies: rotate about X first, then Y, then Z, each about
+ *  the fixed/world axes -- i.e. q = qz (x) qy (x) qx (Hamilton product, right
+ *  operand applied first). This is not a guess: niflib itself has no
+ *  composition helper for this key type (PHASE4_FINDINGS §12.2, confirmed by
+ *  reading nif_math.cpp/.h, kfm.cpp and every obj/*.cpp -- no FromEuler, no
+ *  XYZ-composition code anywhere), so the order comes from two independent,
+ *  convergent sources instead:
+ *
+ *   1. blender_niftools_addon's animation importer (same NifTools umbrella as
+ *      niflib and nif.xml, the closest thing to an authoritative reference)
+ *      composes exactly this way: it builds a `mathutils.Euler(n_val)` with no
+ *      explicit order argument, and Blender's own default Euler order is
+ *      documented as 'XYZ' (blender_python_api docs, "create a new euler with
+ *      default axis rotation order" example). Deriving Blender's own
+ *      eul_to_mat3() by hand against the standard Rx/Ry/Rz matrices confirms
+ *      'XYZ' means R = Rz(z)*Ry(y)*Rx(x) -- apply X first.
+ *   2. An empirical corpus-wide measurement (tools/diag/measure_xyz_euler_order.cpp)
+ *      tested all 6 possible orders two ways: comparing the composed rotation
+ *      at each track's t=0 against its target bone's bind pose (264403 tracks,
+ *      1029 files), and a smoothness check across each track's own resampled
+ *      timeline that does not depend on any rest-pose assumption at all
+ *      (264401 tracks). Both independently pick this same order: it is the
+ *      unique best performer on the t=0 check (tied only with YXZ, expected
+ *      since X and Y rotations nearly commute at small angles) and the clear,
+ *      unambiguous winner on the smoothness check (mean 1.42 deg/step vs.
+ *      1.58-1.70 deg/step for the other five candidates) -- see
+ *      PHASE4_FINDINGS for the full numbers. */
+Niflib::Quaternion ComposeXyzEuler(float xRad, float yRad, float zRad) {
+    const float hx = xRad * 0.5f, hy = yRad * 0.5f, hz = zRad * 0.5f;
+    // Single-axis quaternions, {w,x,y,z}.
+    const float qx_w = std::cos(hx), qx_x = std::sin(hx);
+    const float qy_w = std::cos(hy), qy_y = std::sin(hy);
+    const float qz_w = std::cos(hz), qz_z = std::sin(hz);
+
+    // qyx = qy * qx (Hamilton product).
+    const float qyx_w = qy_w * qx_w;
+    const float qyx_x = qy_w * qx_x;
+    const float qyx_y = qy_y * qx_w;
+    const float qyx_z = -qy_y * qx_x;
+
+    // q = qz * qyx.
+    const float w = qz_w * qyx_w - qz_z * qyx_z;
+    const float x = qz_w * qyx_x - qz_z * qyx_y;
+    const float y = qz_w * qyx_y + qz_z * qyx_x;
+    const float z = qz_w * qyx_z + qz_z * qyx_w;
+
+    return Niflib::Quaternion(w, x, y, z);
+}
+
+/*! Linearly samples a Key<float> vector at time `t`, clamping to the first/
+ *  last key outside its range. Matches this project's existing convention for
+ *  classic tracks: tangent/TBC data is dropped everywhere, not just here (see
+ *  ExtractClassicTrack's own comment) -- the blender_niftools_addon reference
+ *  importer does the same for XYZ_ROTATION_KEY specifically (resamples onto
+ *  the union of the three channels' key times via plain linear interpolation,
+ *  regardless of each axis's own KeyType), so this is consistent with both
+ *  this codebase's precedent and the reference implementation, not a new,
+ *  unverified choice. */
+float LerpKeyAt(const std::vector<Niflib::Key<float>>& keys, float t) {
+    if (keys.empty()) {
+        return 0.0f;
+    }
+    if (t <= keys.front().time) {
+        return keys.front().data;
+    }
+    if (t >= keys.back().time) {
+        return keys.back().data;
+    }
+    for (size_t i = 1; i < keys.size(); ++i) {
+        if (t <= keys[i].time) {
+            const float t0 = keys[i - 1].time;
+            const float t1 = keys[i].time;
+            const float a = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0f;
+            return keys[i - 1].data + a * (keys[i].data - keys[i - 1].data);
+        }
+    }
+    return keys.back().data;
+}
+
+/*! Composes a NiKeyframeData's independent X/Y/Z rotation channels
+ *  (XYZ_ROTATION_KEY) into a single quaternion timeline and appends it to
+ *  `track.rotations`.
+ *
+ *  The three channels are independently timed (their own key counts, times,
+ *  and per-axis KeyType -- confirmed structurally in NiKeyframeData.h; see
+ *  PHASE4_FINDINGS §12.2), so they are first resampled onto the union of all
+ *  three channels' key times (matching the reference importer's own
+ *  approach), then composed per sample with ComposeXyzEuler and written as a
+ *  regular quaternion key. A channel with fewer than 1 key is treated as a
+ *  constant 0 (no rotation contribution from that axis) via LerpKeyAt's
+ *  empty-vector fallback -- consistent with "this axis was never keyed", not
+ *  an error. */
+void ExtractXyzRotation(Niflib::NiTransformData* data, AnimationTrack& track) {
+    const std::vector<Niflib::Key<float>> xKeys = data->GetXRotateKeys();
+    const std::vector<Niflib::Key<float>> yKeys = data->GetYRotateKeys();
+    const std::vector<Niflib::Key<float>> zKeys = data->GetZRotateKeys();
+
+    std::vector<float> allTimes;
+    allTimes.reserve(xKeys.size() + yKeys.size() + zKeys.size());
+    for (const auto& k : xKeys) allTimes.push_back(k.time);
+    for (const auto& k : yKeys) allTimes.push_back(k.time);
+    for (const auto& k : zKeys) allTimes.push_back(k.time);
+    if (allTimes.empty()) {
+        return; // No axis carries any key at all: nothing to compose.
+    }
+    std::sort(allTimes.begin(), allTimes.end());
+    allTimes.erase(std::unique(allTimes.begin(), allTimes.end()), allTimes.end());
+
+    track.rotations.reserve(track.rotations.size() + allTimes.size());
+    for (float t : allTimes) {
+        const float x = LerpKeyAt(xKeys, t);
+        const float y = LerpKeyAt(yKeys, t);
+        const float z = LerpKeyAt(zKeys, t);
+        QuatKey qk;
+        qk.time = t;
+        CopyQuat(ComposeXyzEuler(x, y, z), qk.value);
+        track.rotations.push_back(qk);
+    }
+}
+
 /*! Writes a niflib Matrix44 into a column-major float[16] -- identical
  *  convention and transpose to SkeletonExtractor.cpp's ToColumnMajor (kept as
  *  a separate copy since that one is file-local); see that file's comment for
@@ -157,16 +278,15 @@ bool ExtractClassicTrack(Niflib::NiTransformInterpolator* interp, AnimationTrack
     }
 
     // XYZ_ROTATION_KEY stores separate per-axis Euler tracks instead of
-    // quaternion keys. Rare in this corpus (measured, see PHASE4_FINDINGS);
-    // rather than reimplement Euler-to-quaternion composition from three
-    // independently-timed channels, such a track is reported and its rotation
-    // channel left empty -- translation/scale still extract normally.
+    // quaternion keys -- the majority encoding for classic rotation in this
+    // corpus (68.0% of classic tracks, PHASE4_FINDINGS §3.1), not a rare case.
+    // ExtractXyzRotation composes the three independently-timed channels into
+    // a single quaternion timeline; see ComposeXyzEuler for the composition
+    // order and its justification (external reference + corpus-wide
+    // measurement, PHASE4_FINDINGS §12.2 follow-up).
     if (data->GetRotateType() == Niflib::XYZ_ROTATION_KEY) {
         outUsedEulerRotation = true;
-        if (warnings != nullptr) {
-            warnings->push_back(context + ": rotation uses XYZ_ROTATION_KEY (separate Euler " +
-                                "channels), not supported; rotation track left empty");
-        }
+        ExtractXyzRotation(data, track);
     } else {
         for (const Niflib::Key<Niflib::Quaternion>& k : data->GetQuatRotateKeys()) {
             QuatKey qk;

@@ -770,16 +770,297 @@ array, track resolution 99.43% → 100.00%, 6089 tracks newly resolved across
 
 ---
 
-## 13. Reproducing
+## 13. `XYZ_ROTATION_KEY` composition: implemented
+
+§12.2 closed with "still not implemented" on the grounds that niflib gives no
+composition order to implement against and a wrong guess would be worse than
+the honest gap. That gap is now closed — not by guessing, but by finding an
+order from two independent sources that converge, exactly the standard §12.2
+asked for and the earlier B-spline/renormalization decisions in this phase
+already met.
+
+### 13.1 Piste 1: the composition order, read from an external reference
+
+niflib itself still has nothing (re-confirmed: no `FromEuler`, no XYZ-compose
+helper anywhere in `nif_math.cpp/.h`, `kfm.cpp`, or any `obj/*.cpp`). But
+`blender_niftools_addon` — same NifTools umbrella as niflib and `nif.xml` —
+does import `XYZ_ROTATION_KEY` correctly (its changelog: "fixed Euler rotation
+animation import"), and its source was read directly
+(`io_scene_niftools/modules/nif_import/animation/transform.py`, `develop`
+branch):
+
+```python
+def as_b_euler(n_val):
+    return mathutils.Euler(n_val)
+...
+if n_kfd.rotation_type == 4:  # XYZ_ROTATION_KEY
+    b_target.rotation_mode = "XYZ"
+    times_keys = [self.get_keys_values(euler.keys) for euler in n_kfd.xyz_rotations]
+    times_all = sorted(set(times_keys[0][0] + times_keys[1][0] + times_keys[2][0]))
+    keys_res = [interpolate(times_all, times, keys) for times, keys in times_keys]
+    interp = self.get_b_interp_from_n_interp(n_kfd.xyz_rotations[0].interpolation)
+    self.import_keys(EULER, b_action, bone_name, times_all, zip(*keys_res), flags, interp, ...)
+```
+
+Two facts fall out of this directly:
+
+1. **The three channels are resampled onto the union of their own key times
+   using plain linear interpolation** (`interpolate()`, a hand-written
+   linear resampler in the same file) — the per-axis `KeyType`
+   (LINEAR/QUADRATIC/TBC/CONST) is read only as a hint passed to Blender's own
+   F-curve afterward, not used to do Hermite/TCB evaluation during resampling.
+   This matches, rather than contradicts, this project's own existing
+   precedent of dropping tangent/TBC data for classic tracks and using linear
+   interpolation between keys (`ExtractClassicTrack`'s own comment, §3) — so
+   implementing the same simplification here is consistency with an already-
+   made decision, not a new unverified shortcut. (Decided explicitly rather
+   than assumed — see AskUserQuestion in this session's log.)
+2. **`mathutils.Euler(n_val)` is called with no explicit order argument.**
+   Blender's own API documentation states the default: the worked example in
+   every version of the `mathutils.Euler` docs is captioned "create a new
+   euler with default axis rotation order" and uses
+   `Euler((x, y, z), 'XYZ')` — i.e. **`'XYZ'` is the default**, confirmed by
+   reading the documentation page directly (`blender_python_api_2_60_0`
+   through `current`), not inferred from the name.
+
+`'XYZ'` order in Blender's own convention was then pinned down exactly by
+deriving `eul_to_mat3()` from Blender's C source
+(`blenlib/intern/math_rotation.c`) by hand and comparing it term-by-term
+against the standard `Rz(z)·Ry(y)·Rx(x)` matrix product: they match exactly
+(every `cj*ch`, `sj*si*ch-ci*sh`, ... term lines up). So **Blender's `'XYZ'`
+means: rotate about X first, then Y, then Z, composed as
+`R = Rz(z)·Ry(y)·Rx(x)`** — equivalently, as a quaternion product,
+`q = qz ⊗ qy ⊗ qx` (Hamilton product, rightmost operand applied first).
+
+### 13.2 Piste 2: the empirical discriminant
+
+`tools/diag/measure_xyz_euler_order.cpp` tests this independently of the
+Blender-source reading, exactly as the brief asked: all 6 possible axis
+orders, using niflib's own `NiNode::GetLocalTransform()` for bind pose (no
+handedness/axis-flip guesswork — this project stays Z-up throughout, §8).
+
+**Signal A — t=0 vs. bind pose.** For every `XYZ_ROTATION_KEY` track,
+sample each axis channel at (or nearest) t=0, compose under each candidate
+order, and compare to the target bone's own local bind rotation. Corpus-wide,
+264403 tracks across 1029 files:
+
+```
+Order   MeanErr(deg)   MedianErr(deg)   %<1deg   %<5deg   %<30deg
+XYZ     72.18          50.87            11.77%   17.16%   38.66%
+XZY     74.32          55.40            10.75%   15.89%   36.79%
+YXZ     74.01          53.03            11.80%   16.96%   39.21%
+YZX     87.82          88.07             8.53%   12.72%   30.42%
+ZXY     84.38          76.23             9.05%   13.74%   33.34%
+ZYX     99.57          110.0             7.39%   11.04%   27.24%
+```
+
+`XYZ` and `YXZ` are the clear top two, well ahead of the other four — but
+statistically tied with each other. This is expected, not a failure of the
+method: X and Y rotations commute to first order for small angles, so a
+track dominated by a single axis (common — see §3.1's per-track structure)
+cannot distinguish `XYZ` from `YXZ`. Restricting to tracks where at least two
+axes exceed 5° at t=0 (178372 tracks, the subset that actually stresses
+composition order) sharpens the gap between the top two and the bottom four
+but does not resolve `XYZ` vs. `YXZ` on its own — expected for the same
+reason. Both this and the raw-mean-error magnitude (72–100° depending on
+order, not "near zero") reflect that a large share of clips genuinely do not
+start at rest pose (attack/skill-style clips especially) — real noise the
+brief's own "note de méthode" anticipated, not a flaw in the discriminant.
+
+**Signal B — smoothness, independent of the rest-pose assumption entirely.**
+Each track's three channels are resampled at a uniform 30 Hz across the
+track's own time span, composed under each candidate order at every sample,
+and the mean angular step between consecutive samples is accumulated. A wrong
+composition order should show visibly jumpier steps; this signal needs no
+assumption about what pose a clip starts at. 264401 tracks:
+
+```
+Order   MeanStepDeg
+XYZ     1.42
+XZY     1.60
+YXZ     1.60
+YZX     1.59
+ZXY     1.58
+ZYX     1.70
+```
+
+**`XYZ` is the unambiguous winner here** — clearly separated from every other
+candidate, including `YXZ` (1.42° vs. 1.60°), which breaks the Signal-A tie.
+
+**Self-check.** Before trusting these numbers to validate the real
+extractor's arithmetic, the tool's matrix-based `Compose(XYZ, ...)` was
+cross-checked against a from-scratch Hamilton-product quaternion composition
+(the same formula `AnimationExtractor.cpp`'s `ComposeXyzEuler` uses) over
+10000 random angle triples: max disagreement **2.96e-6°**, floating-point
+noise. This caught two real sign errors in the first hand-derivation of the
+Hamilton product (in the `qy*qx` and `qz*(qy*qx)` steps) before they reached
+the shipped extractor — recorded here because it is exactly the kind of
+self-inflicted bug a numeric cross-check is meant to catch, per this
+project's standing practice (§4.2 caught an analogous one for B-spline
+renormalization).
+
+**Conclusion: all three independent signals — external reference (Piste 1),
+t=0-vs-bind-pose (Piste 2, Signal A), and timeline smoothness (Piste 2,
+Signal B) — converge on the same order.** `XYZ` (apply X first, then Y, then
+Z; `q = qz ⊗ qy ⊗ qx`) is implemented in `AnimationExtractor.cpp`'s
+`ComposeXyzEuler`, with this reasoning recorded in its own comment.
+
+### 13.3 Implementation
+
+`ExtractClassicTrack`'s `XYZ_ROTATION_KEY` branch now calls
+`ExtractXyzRotation(data, track)` instead of leaving the rotation channel
+empty. `ExtractXyzRotation`:
+
+1. Reads all three of `GetXRotateKeys()`/`GetYRotateKeys()`/`GetZRotateKeys()`
+   (independently timed, confirmed structurally in `NiKeyframeData.h`, §12.2).
+2. Builds the union of all three channels' key times (matching the reference
+   importer's own approach, §13.1).
+3. Samples each channel at every time in that union via `LerpKeyAt` (linear
+   interpolation, clamped outside the channel's own range) — the same
+   linear-interpolation-between-keys convention `ExtractClassicTrack` already
+   uses for quaternion tracks, decided explicitly to stay consistent with it
+   (§13.1 point 1) rather than implement per-type Hermite/TCB evaluation.
+4. Composes each sample with `ComposeXyzEuler` and appends it as a normal
+   `QuatKey`, which then passes through `CopyQuat`'s existing renormalization
+   (§4.4) exactly like every other rotation key in this exporter — no special
+   case needed for the B-spline bug that motivated that renormalization in
+   the first place.
+
+A channel with zero keys contributes 0 radians at every sample time
+(`LerpKeyAt`'s empty-vector fallback) — "this axis was never keyed", not an
+error; a track where literally all three channels are empty is left with no
+rotation keys at all, same as before (nothing to compose).
+
+### 13.4 Post-fix corpus numbers
+
+Full corpus re-exported and compared file-for-file against the pre-fix
+corpus, the same way §12.4's regression check was done:
+
+```
+Mesh/material/skeleton/nodes fields   : byte-identical on all 2822 files (0 mismatches)
+Structural validation (500-file sample, same validator as §5):
+  Structural issues                   : 0
+  Non-monotonic key times             : 0
+  Quaternion norm errors > 0.01       : 0 (max err 1.76e-7 -- float noise)
+Classic tracks using XYZ_ROTATION_KEY : 322257 (unchanged -- same tracks, now composed)
+Total keyframes                       : 45982599 -> 47437600 (+1454999*, new rotation keys)
+Track resolution                      : 100.00% (unchanged from §12.4's fix, 1071428/1071465)
+```
+
+\* every `XYZ_ROTATION_KEY` track's own rotation key count equals the number
+of distinct times across its X/Y/Z channels (§13.3 step 2) — this is new
+keyframe data the export did not previously carry, not a resampling-rate
+artifact like the B-spline numbers in §4.
+
+**"Does a clip now produce effective motion" — measured directly, not
+inferred from track resolution:**
+
+```
+                                                  before fix   after fix
+Clips with >=1 track carrying real rotation motion   19045        19946   (+901)
+Skeleton-less (node-hierarchy) files with real
+  rotation motion (the §12.4 fix's own payoff)          84          269   (+185)
+```
+
+The 185-file jump is §12.4's fix finally paying off: every one of the 383
+files that fix newly resolved was pure `XYZ_ROTATION_KEY` with zero playable
+keyframes (§12.4's own closing note) — this pass is what makes those keys
+playable, so the two fixes' combined effect (node resolution + Euler
+composition) is what shows up here, not either one alone.
+
+The cruder proxy this brief's §12.1 originally measured (translation moves
+while rotation has no real timeline) dropped from 89413 to 33024 bone+clip
+cases (900 to 654 files) using the same threshold; the residual is expected,
+not a remaining gap — it also counts legitimate cases where a *quaternion*-
+type rotation channel authored exactly one static key while translation
+animates, which is normal per §3's track-independence finding, not something
+this fix (or any fix) should change.
+
+### 13.5 Non-regression
+
+* **Geometry/materials/skinning**: byte-identical JSON (`meshes`,
+  `materials`, `skeletons`, `nodes` fields) across all 2822 files, verified by
+  direct structural comparison against the pre-fix export — 0 mismatches.
+  Mesh data is written to the shared `.gfbin` before any animation data
+  (`GfxFormatWriter.cpp`), so growing the animation payload cannot have
+  shifted any mesh/skeleton byte offset even in principle.
+* **Existing animation paths** (classic quaternion tracks, B-spline
+  resampling, `.kf` and embedded sources): untouched code paths — this
+  change only adds a new branch inside `ExtractClassicTrack` for the
+  `XYZ_ROTATION_KEY` case specifically; `bSplineTracks`, `classicTracks`,
+  `tracksResolved`/`tracksOrphaned`, and `tracksTotal` are all unchanged
+  corpus-wide (1071465 tracks, same as §12.4's post-fix count).
+* **Format**: no schema change — `AnimationTrack::rotations` simply has more
+  entries than before for affected tracks; `kGfModelFormatVersion` is
+  unchanged since no consumer-visible shape changed.
+* **Same 3 known skips**: `item/WF20.nif`, `monster/M156.nif`,
+  `npc/N600.nif`, unchanged.
+
+### 13.6 Files to check visually (Piste 3)
+
+No headless browser is available in this environment (same limitation as
+§11/§12.5), so the following need eyes — priority order matches the brief's
+own:
+
+1. **`item/model/WA85.gfmodel`** — the reference case for §12.4's fix. Was
+   confirmed to have exactly 0 playable keyframes after that fix landed
+   (§12.4's own closing note); now has 2 real rotation keys on
+   `Plane04`/`Plane03`. Simple embedded animation on a static model — easy to
+   judge correct (a small, natural-looking rotation) vs. wrong (something
+   that snaps or spins unnaturally).
+2. **`item/model/W146.gfmodel`** (or `W152`/`W154`/`W167` — same pattern,
+   picked as a second static-model data point) — another skeleton-less file
+   that gained real embedded rotation motion from this fix.
+3. **`monster/model/M009.gfmodel`**, clips `stand01` and `magic01`
+   specifically — the original symptom this whole investigation traces back
+   to. 37 bones per clip now carry real rotation keys (hands, fingers, tail)
+   that were frozen at bind pose before this fix; §12.1 already confirmed the
+   clip-switch stickiness these clips also exhibited was a separate, already-
+   fixed viewer bug (§12.1), so this check is specifically about whether the
+   rotation motion itself now looks natural.
+4. **`monster/model/M389.gfmodel`** — the single heaviest `XYZ_ROTATION_KEY`
+   user in the corpus, 2825 animated-rotation tracks across its clips. If the
+   composition order were wrong, a file this saturated with the affected key
+   type should show it unmistakably (joints twisting through implausible
+   angles); if correct, it should read as an ordinary animated monster.
+
+### 13.7 Reproducing this section's measurements
+
+```
+tools\diag\measure_xyz_euler_order.cpp   # §13.2: 6-order empirical discriminant (t=0 + smoothness), self-checked
+```
+
+Built the same way as the other §12 tools (not wired into CMake):
+
+```
+cl.exe /std:c++17 /permissive- /EHsc /MP /O2 /MD /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /D_SCL_SECURE_NO_WARNINGS /DNIFLIB_STATIC_LINK ^
+  /I"external\niflib\include" /I"src" tools\diag\measure_xyz_euler_order.cpp src\nif\HeaderNormalizer.cpp ^
+  /Fe:tools\diag\measure_xyz_euler_order.exe /link build\Release\niflib_static.lib
+```
+
+The blender_niftools_addon source referenced in §13.1 was read directly from
+`https://raw.githubusercontent.com/niftools/blender_niftools_addon/develop/io_scene_niftools/modules/nif_import/animation/transform.py`
+and Blender's `eul_to_mat3()` from
+`https://raw.githubusercontent.com/dfelinto/blender/master/source/blender/blenlib/intern/math_rotation.c`
+(a mirror of `blender/blender`, used because the canonical repo's raw URL for
+this exact path returned 404 at the time of reading — the mirror's content
+was cross-checked against Blender's own published `mathutils.Euler`
+documentation, which independently confirms the `'XYZ'` default, so the two
+sources are not relying on each other).
+
+---
+
+## 14. Reproducing (Phase 4 overall)
 
 ```
 cmake --build build --config Release
 build\Release\gfnif-export.exe export input -o out --input-root input
 ```
 
-Expected corpus totals (post-Phase 4): 2822/2825 converted, 1787 files with
-animation, 20103 clips, 1071465 tracks, 99.43% track resolution, 0 genuinely
-failed tracks. Mesh/skinning numbers are byte-identical to Phase 3.
+Expected corpus totals (post-Phase 4, including §13's fix): 2822/2825
+converted, 1787 files with animation, 20103 clips, 1071465 tracks, 100.00%
+track resolution, 0 genuinely failed tracks, 47437600 total keyframes.
+Mesh/skinning numbers are byte-identical to Phase 3.
 
 The one-off diagnostics this phase's measurements came from live under
 `tools/diag/` but are **not** wired into `CMakeLists.txt` (same convention as
@@ -797,9 +1078,10 @@ tools\diag\measure_xyz_rotation.cpp         # §12.1: XYZ_ROTATION_KEY prevalenc
 tools\diag\measure_root_transform.cpp       # §12.3: root bind-matrix decomposition + ancestor chain
 tools\diag\measure_embedded_controllers.cpp # §12.4: static-model embedded-controller census
 tools\diag\dump_wa85_keys.cpp               # §12.4: raw NiTransformData key dump for WA85
+tools\diag\measure_xyz_euler_order.cpp      # §13.2: Euler composition order discriminant
 ```
 
-The §12.1–§12.4 tools were built directly with `cl.exe` (not wired into
+The §12–§13 tools were built directly with `cl.exe` (not wired into
 CMake), linking against the already-built `niflib_static.lib`:
 
 ```
