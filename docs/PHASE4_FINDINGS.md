@@ -509,7 +509,268 @@ numeric/structural only on this side; the following need eyes:
 
 ---
 
-## 12. Reproducing
+## 12. Phase 4 follow-up: three viewer-reported problems, measured and (partly) fixed
+
+Three problems were reported from viewer use after the §9 fix (mixer root
+exposing `.skeleton`): clips that break bone orientation persistently on
+switch (`monster/M009`'s `stand01`/`magic01`), several monster models
+appearing tilted or floating despite the Z-up→Y-up toggle, and embedded
+animation on static (skeleton-less) models never producing motion
+(`item/WA85`). Each was investigated by measuring first, per this project's
+standing rule — and two of the three brief hypotheses did not survive
+measurement.
+
+### 12.1 Orientation "stuck" after switching clips — confirmed and fixed, in the viewer
+
+**Root cause: `THREE.AnimationAction.stop()` does not restore a bone's
+pre-clip transform.** A clip only carries tracks for the channels it
+actually animates (an XYZ_ROTATION_KEY track, for instance, has translation
+but no rotation keys at all — §3.1). Switching from a clip that moved a
+bone's quaternion to one that never touches that bone leaves the bone stuck
+at whatever the previous clip last wrote, indefinitely, because nothing ever
+tells THREE to reset it. This is a `tools/viewer/index.html` bug, not an
+export defect: the `.gfmodel`/`.gfbin` data was never wrong.
+
+**Fix**: `buildScene()` now returns every bone/node object alongside the
+already-decomposed bind pose (`buildBones`/`buildSceneNodes` call
+`Matrix4.decompose` onto each object once, at load time, before any clip has
+run). `show()` snapshots that as `bindPose`
+(`snapshotBindPose`/`restoreBindPose`), and `playClip()` restores it
+unconditionally before starting the next `AnimationAction`. Every bone now
+starts each clip from a known-good rest pose regardless of what the previous
+clip left untouched.
+
+**`monster/M009`'s `stand01`/`magic01` specifically, measured**: the brief's
+stated hypothesis — these two clips have a bone whose translation moves
+while XYZ_ROTATION_KEY leaves its rotation frozen — **does not hold**. All 8
+of M009's clips (everything from its one `.kf`) share the identical
+zero-channel signature: the same 4 bones (`Bone01`/`03`/`05`/`06`) have
+XYZ_ROTATION_KEY with **zero translation keys as well** (scale-only, and
+that scale never varies either — `ScaleActuallyAnimates` would report it, it
+does not), and the same 38 of 39 bones have no translation at all except the
+root (`Bip01 NonAccum`), whose own translation range is small and unremarkable
+across every clip including the ones that "work". Nothing in the exported
+data distinguishes `stand01`/`magic01` from `move01`/`death01`/`attack01`/
+`shoot01` at the channel or value level. Combined with the brief's own
+observation that the corruption *persists into a subsequently-reloaded
+working clip* — a session artifact, not a property of one clip's data — this
+is strong evidence the reported M009 symptom **was the clip-switch bug
+above**, not a distinct XYZ_ROTATION_KEY-driven defect. It is expected to be
+gone with the fix; needs the visual re-check listed in §12.4.
+
+**The XYZ_ROTATION_KEY "frozen rotation while translation moves" defect is
+real elsewhere, though, just not on M009**: measured corpus-wide, **2825
+bone+clip cases across 196 distinct files** (`chair`/`item`/`monster`/`npc`/
+`ride`) have a bone whose translation range exceeds 0.5 units in a clip
+while XYZ_ROTATION_KEY leaves its rotation at bind pose — this is the visible
+defect §3.1 anticipated, now with a corpus-wide count. Motion-style clips
+(move/attack/death/...) are *not* less affected than idle-style ones
+(stand/magic/wait/...) — both show roughly proportional occurrence counts,
+so "idle clips are disproportionately exposed" is also not supported.
+**XYZ_ROTATION_KEY quaternion composition remains deliberately
+unimplemented** (see §12.2) — this count is what a future implementation
+would fix.
+
+### 12.2 XYZ_ROTATION_KEY composition: investigated, still deliberately not implemented
+
+Before attempting the composition §3.1 left open, niflib's own source was
+searched for any Euler→quaternion composition logic to implement against.
+**None exists.** `NiKeyframeData::UpdateRotationKeyCount()` is the only code
+in niflib that branches on `XYZ_ROTATION_KEY` at all, and it only does
+key-count bookkeeping, not evaluation — no `FromEuler`, no XYZ-composition
+helper anywhere in `nif_math.cpp`/`.h`, `kfm.cpp`, or any `obj/*.cpp`. No
+comment, docstring, or KFM code anywhere in niflib states an intended
+composition order or handedness for the three axis channels either.
+
+Structurally, `NiKeyframeData::Read()` confirms the three axis channels
+(`GetXRotateKeys`/`GetYRotateKeys`/`GetZRotateKeys`) are **independent**:
+each has its own key count, its own key times, and its own interpolation
+type (`GetXRotateType()` etc., separate from the overall `GetRotateType()`,
+and not restricted to `LINEAR_KEY` — `QUADRATIC_KEY`/`TBC_KEY`/`CONST_KEY`
+are all structurally possible per axis). A correct implementation would need
+to resample/union three independently-timed, independently-interpolated
+channels before composing a quaternion at each sample time, using a
+composition order and handedness that **cannot be sourced from niflib
+itself** — it would have to be assumed from an external, unverifiable
+convention (e.g. a NifSkope/community default) with no ground truth in this
+project to check it against, unlike every other numeric decision in Phase 4
+(§4.2's B-spline endpoint check, §4.4's renormalization, §5's structural
+validator).
+
+**Decision: still not implemented.** A wrong guessed composition would
+silently produce incorrect animation — worse than the current honest gap
+(rotation empty, translation/scale still play, a warning names the track).
+This is recorded as a deliberate non-implementation with the investigation
+that led to it, not an oversight; §12.1's 196-file/2825-case count is what
+it would fix if a verifiable convention is ever found.
+
+### 12.3 Seven "tilted/floating" monster models — hypothesis refuted; not an exporter defect
+
+**All 1465 skinned models in the corpus — every one flagged as
+tilted/floating and every one not — have an exactly identical root bone
+(`bones[0]`) bind matrix: translation `(0,0,0)`, scale `(1,1,1)`, 0° rotation
+from identity.** This includes all 7 flagged files (`M011`, `M017`, `M028`,
+`M016`, `M019`, `M025`, `M022`) and `M011`'s Phase 1 comparison twin `M903`.
+
+The reason is structural, not a fluke: in every file checked, the block
+named `Scene Root` is simultaneously the file's only unreferenced root *and*
+the skin's `GetSkeletonRoot()`, and `Scene Root`'s own local transform is
+authored as identity with nothing above it in the hierarchy. `EnsureSkeleton`
+seeding `bones[0]` from `GetWorldTransform()` (§ "the transpose trap"
+composition, unchanged by this pass) therefore reduces to identity
+corpus-wide — there is no "everything above the skeleton root" for it to
+bake in, because nothing sits above `Scene Root`. **The brief's hypothesis
+that a Phase 2/3 flattening disagreement or a non-identity root transform
+explains these 7 files is refuted by direct measurement, not merely
+unconfirmed.**
+
+The real per-file variation lives one level down, at each file's `Bip01`
+(or equivalent) child bone, which does carry large, file-specific,
+non-identity rotations (e.g. measured ~18° tilt on one flagged file, ~90°
+on another) — but this is present on **every** file checked, flagged or not,
+including `M903`, and matches the standard 3ds-Max-Biped convention where
+the biped root's authored local orientation is corrected for downstream by
+the rig/animation, not a property distinguishing the 7 files.
+
+None of the 7 flagged files have any unskinned geometry (each is a single
+mesh, fully skinned), so the brief's proposed static-vs-skinned
+cross-check is structurally inapplicable to them — there is no second,
+independently-flattened path in these files to disagree with the skeleton.
+
+**Conclusion: the exported skeleton/bind-pose data for these 7 files is
+correct**, consistent with §6's numeric bind-pose check (5.2e-16 of model
+diagonal) and this pass's own corpus-wide zero-exception measurement. If the
+reported symptom is real, its cause is not in the exporter's static export —
+the most likely remaining locus is animation playback (a bone stuck from a
+previous clip, exactly §12.1's mechanism, landing on one of these 7 files)
+or something viewer-specific not yet identified. None of the 7 files
+currently appear in §12.1's 196-file XYZ_ROTATION_KEY-defect list, so if
+§12.1's fix does not resolve what was seen on these files, the cause is
+still open and needs a fresh look with the clip-switch bug now ruled out.
+**Not treated as fixed by this pass** — see §12.4 for what to re-check.
+
+### 12.4 Embedded animation on skeleton-less models — confirmed and fixed, in the exporter
+
+**Confirmed exactly as the brief's primary hypothesis stated, with one
+refinement.** `item/WA85.nif` has no skinned mesh, so `scene.skeletons` was
+empty and every embedded track's `FindBoneByName(nullptr, ...)` returned -1
+unconditionally — but the track was still *kept* (orphaned, per the
+"warn, don't drop" discipline), so the clip was not literally track-less;
+it had 2 orphaned tracks, both with every channel empty (both of WA85's
+controllers are pure XYZ_ROTATION_KEY with no translation/scale data at
+all — WA85 is a case where §12.1/§12.2's gap and this section's gap
+compound). Measured corpus-wide: **336 of 1358 skeleton-less (static) `.nif`
+files** have at least one embedded `NiTransformController` with real,
+non-null interpolator data that a skeleton-aware resolver could never
+reach. The brief's speculated "mixed" case — a skinned file with an embedded
+controller targeting a node *outside* its skeleton's own subtree — was
+searched for and **found nowhere in the corpus (0 files)**.
+
+**Fix, implemented in the exporter**: `SceneModel.hpp` gains `SceneNode`
+(name, parent index, local transform — the same shape as `BoneData` minus
+`isAttachPoint`) and `SceneData::nodes`. `AnimationExtractor.hpp/.cpp` gains
+`BuildNodeHierarchy()` (same parent-before-child walk as
+`SkeletonExtractor::CollectBones`, but over every `NiAVObject`, not just
+`NiNode`) and a `ResolveTargetIndex()` that tries the skeleton first, then
+falls back to the node list. `MeshExtractor.cpp`'s `ExtractScene` builds the
+node list **only when `scene.skeletons` is empty** (matching the measured
+"0 mixed cases" — a skinned file never needs it and never pays for it), and
+keeps it in `scene.nodes` (so it reaches the `.gfmodel`) **only if the file
+gained at least one animation track that needed it** — the other ~1000
+skeleton-less files with no embedded controller at all still export `nodes:
+[]` at no cost. `GfxFormatWriter.cpp` serializes `nodes` the same way as
+`skeletons`. Verified directly on `WA85`: both of its tracks now resolve
+(`boneIndex` 5 and 7 into a 14-node hierarchy rooted at `Scene Root`),
+100% track resolution, up from 0%.
+
+The viewer (`tools/viewer/index.html`) gained `buildSceneNodes()`, building
+a plain `THREE.Object3D` tree (not `THREE.Bone` — nothing here skins
+geometry) the same way `buildBones()` builds a bone tree, and
+`buildAnimationClips()` now targets a track by bare object name
+(`"nodeName.quaternion"`, THREE's `PropertyBinding` name-search fallback for
+any path that isn't a `.bones[]`/`.materials[]` special form) instead of
+`.bones[name]` when the model has no skeleton at all. Both node and bone
+objects are covered by §12.1's bind-pose snapshot/restore.
+
+**Full corpus re-export completed and measured (this is no longer a
+sample-based estimate).** Comparing every one of the 2822 convertible files
+before/after this fix, file for file:
+
+```
+Mesh/material/skeleton fields              : byte-identical on all 2822 files (0 mismatches)
+Files gaining a populated "nodes" array    : 394
+Track resolution, corpus-wide              : 1065339/1071465 (99.43%) -> 1071428/1071465 (100.00%)
+Newly-resolved tracks                      : 6089, across 383 files
+  of those files' now-resolving clips, by origin: 353 embedded, 79 external .kf
+    (a file can have both; these are not disjoint counts)
+Files where playable keyframe count increased : 0
+```
+
+**The fix is structurally complete and fully verified — track resolution on
+skeleton-less files is now 100%, up from 6126 orphaned tracks corpus-wide
+before this pass — but its effect on visible motion in today's corpus is
+currently zero**, not the partial gain hoped for. Every one of the 6089 newly-resolved tracks turns
+out to have the same empty-channel signature as WA85's own two tracks: pure
+XYZ_ROTATION_KEY rotation with no translation or scale data, so resolving
+the *target* correctly still leaves zero playable keyframes on that track
+(§12.2's still-open gap). This was not obvious in advance — the WA85 case
+was assumed to be one data point, not representative of the entire
+skeleton-less-embedded-animation population — and is recorded here plainly
+because it means §12.2 (XYZ_ROTATION_KEY composition) is now the sole
+remaining blocker on this entire class of animation, not two independent,
+partially-overlapping problems. **Also confirmed corpus-wide: the "mixed"
+case (a skinned file with an embedded controller outside its skeleton's own
+subtree) is still 0 files** on the full corpus, not just the earlier sample
+— the measured absence in §12.4's first paragraph holds exactly.
+
+This fix is kept regardless of §12.2's status: it is a real, verified
+correctness fix (100% vs. 99.43% resolution, zero regressions elsewhere),
+it is a prerequisite for §12.2 ever mattering on these 383 files, and a
+future file in this corpus or an updated one could still have a
+skeleton-less controller with real translation/scale data that this fix
+would correctly surface today, independent of the rotation gap.
+
+### 12.5 What to check next
+
+**Done in this pass**: full corpus re-export completed and diffed file for
+file against the pre-fix corpus (§12.4's numbers) — 0 mesh/material/skeleton
+regressions across all 2822 files, 394 files gained a populated `nodes`
+array, track resolution 99.43% → 100.00%, 6089 tracks newly resolved across
+383 files, 0 files gained playable keyframes (blocked on §12.2).
+
+**Still not done, needed before closing this out:**
+
+1. **Visual re-check** (no headless browser available in this environment,
+   same limitation as §11):
+   - `monster/model/M009.gfmodel`: cycle through all 8 clips multiple times
+     in the dropdown, ending on `stand01` and `magic01` — expected: normal
+     pose and normal animation on every clip, no persistent distortion,
+     confirming §12.1's fix actually addresses what was seen (the exported
+     data itself gave no reason to expect a distinct defect here).
+   - `monster/model/M011`, `M017`, `M028`, `M016`, `M019`, `M025`, `M022`:
+     re-check orientation after cycling clips per the point above. Expected,
+     per §12.3's measurement: these files' bind pose (clip-free, right after
+     load) was always correct, so if a problem is still visible on first
+     load with no clip switching, it is a **new, unexplained finding** — the
+     exporter's static skeleton data is confirmed correct for all 7, so a
+     first-load defect cannot be one of the causes this pass ruled out.
+   - `item/model/WA85.gfmodel`: **will still show no motion** — both its
+     tracks now resolve (100%, up from orphaned) but carry zero playable
+     keyframes (§12.4's compounding note). This is expected and matches
+     every other file that gained a resolved skeleton-less track in this
+     pass (§12.4: 0 of 383 such files gained any playable keyframe) — there
+     is currently no file in the corpus that would visually demonstrate the
+     node-hierarchy path driving geometry, since every skeleton-less
+     controller happens to be pure XYZ_ROTATION_KEY. That visual
+     confirmation becomes possible once §12.2 is implemented (or on a future
+     corpus/file with non-Euler skeleton-less animation) — until then, the
+     node-resolution fix is verified structurally (100% resolution,
+     `boneIndex` pointing at the right entry, 0 regressions) rather than
+     visually.
+
+---
+
+## 13. Reproducing
 
 ```
 cmake --build build --config Release
@@ -529,10 +790,27 @@ including `src/`, same pattern as `gfnif-export`) or build it directly with
 the MSVC compiler against `niflib_static.lib`:
 
 ```
-tools\diag\measure_bspline_error.cpp     # §4.3: error vs. sample rate
-tools\diag\verify_bspline_boundary.cpp   # §4.2: niflib evaluator self-check
-tools\diag\validate_gfmodel.ps1 -OutDir <out>   # §5: structural format validation (PowerShell, runs as-is)
+tools\diag\measure_bspline_error.cpp        # §4.3: error vs. sample rate
+tools\diag\verify_bspline_boundary.cpp      # §4.2: niflib evaluator self-check
+tools\diag\validate_gfmodel.ps1 -OutDir <out>          # §5: structural format validation (PowerShell, runs as-is)
+tools\diag\measure_xyz_rotation.cpp         # §12.1: XYZ_ROTATION_KEY prevalence/defect count
+tools\diag\measure_root_transform.cpp       # §12.3: root bind-matrix decomposition + ancestor chain
+tools\diag\measure_embedded_controllers.cpp # §12.4: static-model embedded-controller census
+tools\diag\dump_wa85_keys.cpp               # §12.4: raw NiTransformData key dump for WA85
 ```
+
+The §12.1–§12.4 tools were built directly with `cl.exe` (not wired into
+CMake), linking against the already-built `niflib_static.lib`:
+
+```
+cl.exe /std:c++17 /permissive- /EHsc /MP /O2 /MD /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /D_SCL_SECURE_NO_WARNINGS /DNIFLIB_STATIC_LINK ^
+  /I"external\niflib\include" /I"src" tools\diag\<tool>.cpp src\nif\HeaderNormalizer.cpp ^
+  /Fe:tools\diag\<tool>.exe /link build\Release\niflib_static.lib
+```
+
+`/MD` is required: `niflib_static` is itself built `/MD` (see the CMake
+config), and a plain `cl.exe` invocation without it link-fails with
+CRT-duplicate `LNK2005` errors.
 
 ### Viewer
 

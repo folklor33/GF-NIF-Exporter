@@ -112,6 +112,29 @@ struct SkeletonData {
     std::vector<BoneData> bones;
 };
 
+/*! One node of a static (skeleton-less) file's scene graph, exported only for
+ *  files that actually need it -- see SceneData::nodes.
+ *
+ *  A skinned file's animation targets bones in SkeletonData, which already
+ *  carries every node in the skeleton root's subtree (not just weighted
+ *  ones, see BoneData). A file with NO skin has no SkeletonData at all, so an
+ *  embedded NiTransformController on a plain NiNode -- a rotating prop, a
+ *  moving door, a billboard pivot -- had nothing to resolve its target
+ *  against and was silently orphaned (see PHASE4_FINDINGS, the WA85 case).
+ *  SceneNode is the minimal fix: the same {name, parent, local transform}
+ *  shape as BoneData, so AnimationTrack can resolve by name against it with
+ *  the identical mechanism, and a consumer builds a THREE.Object3D chain
+ *  from it exactly as it builds a THREE.Bone chain from SkeletonData. */
+struct SceneNode {
+    /*! The NiNode/NiAVObject name, stored exactly as it appears in the file. */
+    std::string name;
+    /*! Index of the parent in SceneData::nodes, or -1 for a root. Parents
+     *  always precede their children. */
+    int parentIndex = -1;
+    /*! The node's rest transform in its parent's space. Column-major. */
+    float localMatrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+};
+
 /*! A single drawable. Both NiTriShape and NiTriStrips collapse into this:
  *  strips are de-stripified into a plain indexed triangle list. */
 struct MeshData {
@@ -391,15 +414,18 @@ struct QuatKey {
  *  channel means the source did not animate that property; the consumer keeps
  *  the bone's bind-pose value for it. */
 struct AnimationTrack {
-    /*! Bone name exactly as the source spells it, matching BoneData::name --
-     *  the same string this track was resolved against. Kept even when
-     *  boneIndex resolved successfully, so a consumer can re-bind without
-     *  reparsing the source. */
+    /*! Target name exactly as the source spells it, matching BoneData::name
+     *  or SceneNode::name -- the same string this track was resolved
+     *  against. Kept even when boneIndex resolved successfully, so a
+     *  consumer can re-bind without reparsing the source. */
     std::string boneName;
-    /*! Index into the clip's target SkeletonData::bones, or -1 when the name
-     *  could not be resolved (an orphaned .kf track). An orphaned track is
-     *  still emitted -- see AnimationClip -- so the corpus-wide resolution
-     *  rate can be measured from the exported data itself. */
+    /*! Index into the clip's target SkeletonData::bones (when the file has a
+     *  skeleton) or SceneData::nodes (when it does not -- see SceneNode),
+     *  or -1 when the name could not be resolved in either. Which array it
+     *  indexes is unambiguous per file: a file never populates both (see
+     *  SceneData::nodes). An orphaned track is still emitted -- see
+     *  AnimationClip -- so the corpus-wide resolution rate can be measured
+     *  from the exported data itself. */
     int boneIndex = -1;
     std::vector<VectorKey> translations;
     std::vector<QuatKey> rotations;
@@ -441,6 +467,13 @@ struct SceneData {
      *  one armature root. Kept as a vector so a file with genuinely separate
      *  armatures would not need a format change. */
     std::vector<SkeletonData> skeletons;
+    /*! The file's node hierarchy, exported ONLY when skeletons is empty AND
+     *  the file has at least one embedded animation track that needs it (see
+     *  SceneNode) -- kept empty for the overwhelming majority of static
+     *  files to avoid any change to the validated Phase 2 flattened-vertex
+     *  path. A skinned file never populates this: SkeletonData already
+     *  covers every node in its skeleton root's subtree. */
+    std::vector<SceneNode> nodes;
     /*! Embedded animations plus every .kf found for this file under the
      *  <type>/animation/NAME.kf convention. Empty when the file has neither. */
     std::vector<AnimationClip> animations;

@@ -26,6 +26,15 @@ class NiObjectNET;
 
 namespace gfnif {
 
+/*! Walks every NiAVObject reachable from `root` and returns it as a flat
+ *  SceneNode list, parent-before-child, mirroring SkeletonExtractor's
+ *  CollectBones -- see SceneNode for why this exists. Intended for a
+ *  skeleton-less file only; the caller decides whether to keep the result
+ *  (see PHASE4_FINDINGS: it is discarded unless the file turns out to have a
+ *  real embedded animation track to resolve against it, so files with no
+ *  embedded controllers at all pay nothing extra). */
+std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root);
+
 /*! Extracts animation clips for one .nif, given the SkeletonData already built
  *  for it (or an empty one, for a file with animation controllers but no
  *  skin -- bones are still resolved by name against the node hierarchy). */
@@ -41,22 +50,27 @@ public:
      *  PHASE4_FINDINGS) is skipped silently -- that is normal, not a failure.
      *
      *  `skeleton` is scene.skeletons[skeletonIndex] if the file has one, or
-     *  nullptr if it does not; bones are resolved by exact name match against
-     *  it either way (a file can carry embedded animation without any skin). */
-    void ExtractEmbedded(Niflib::NiAVObject* root, const SkeletonData* skeleton, SceneData& scene,
+     *  nullptr if it does not. `nodes`, when non-null, is a node hierarchy
+     *  already built from this same `root` for a skeleton-less file (see
+     *  BuildNodeHierarchy) -- a track's target name is resolved against
+     *  whichever of the two is non-null; a file never has both (measured
+     *  corpus-wide, see PHASE4_FINDINGS). */
+    void ExtractEmbedded(Niflib::NiAVObject* root, const SkeletonData* skeleton,
+                         const std::vector<SceneNode>* nodes, SceneData& scene,
                          AnimationStats& stats);
 
     /*! Loads `kfPath` (already resolved by the caller from the
      *  <type>/animation/NAME.kf convention) and appends one AnimationClip per
      *  NiControllerSequence root block it contains.
      *
-     *  Every ControllerLink's nodeName is resolved against `skeleton` by exact
-     *  string match; an unresolved name produces an orphaned track (boneIndex
-     *  = -1, kept and reported, never dropped silently) and a warning, per the
-     *  brief's "warn, don't fail" discipline. Returns false only when the file
-     *  itself cannot be parsed at all -- a bad individual track never fails the
-     *  whole load. */
-    bool ExtractFromKf(const std::string& kfPath, const SkeletonData* skeleton, SceneData& scene,
+     *  Every ControllerLink's nodeName is resolved against `skeleton` (or
+     *  `nodes`, on a skeleton-less file) by exact string match; an unresolved
+     *  name produces an orphaned track (boneIndex = -1, kept and reported,
+     *  never dropped silently) and a warning, per the brief's "warn, don't
+     *  fail" discipline. Returns false only when the file itself cannot be
+     *  parsed at all -- a bad individual track never fails the whole load. */
+    bool ExtractFromKf(const std::string& kfPath, const SkeletonData* skeleton,
+                       const std::vector<SceneNode>* nodes, SceneData& scene,
                        AnimationStats& stats);
 
 private:

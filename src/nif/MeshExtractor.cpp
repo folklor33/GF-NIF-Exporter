@@ -487,13 +487,55 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
     // built -- scene.skeletons is a vector for format-generality (see
     // SceneData), but every file in this corpus builds at most one, and
     // SkeletonExtractor's own EnsureSkeleton already warns if a second root is
-    // ever named. A file with animation but no skin has no skeleton to resolve
-    // against; every track then comes back orphaned, which is exactly what
-    // "no skeleton in this file" should report as.
+    // ever named.
+    //
+    // A file with animation but no skin has no SkeletonData to resolve
+    // against. Rather than every such track coming back orphaned, a node
+    // hierarchy is built from the same unreferenced roots (see
+    // BuildNodeHierarchy / SceneNode) and tried as a fallback target list --
+    // covers a plain NiNode a NiTransformController animates directly (a
+    // rotating prop, a moving door) with no skin anywhere in the file.
+    // Measured corpus-wide: no file mixes a real skeleton with an embedded
+    // controller targeting a node outside that skeleton's own subtree, so
+    // building this list only when scene.skeletons is empty costs nothing on
+    // a skinned file and does not risk the two resolution paths disagreeing
+    // on the same file. Kept in scene.nodes (and so written to the .gfmodel)
+    // only if the file turns out to have at least one animation track that
+    // needed it, so the ~1000 static files with no embedded controller at
+    // all pay nothing extra.
     {
         AnimationExtractor animExtractor(&result.warnings);
         const SkeletonData* skeleton =
             scene.skeletons.empty() ? nullptr : &scene.skeletons[0];
+
+        std::vector<SceneNode> nodes;
+        if (skeleton == nullptr) {
+            for (const NiObjectRef& b : blocks) {
+                NiObject* obj = static_cast<NiObject*>(b);
+                if (referenced.find(obj) != referenced.end()) {
+                    continue;
+                }
+                if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
+                    std::vector<SceneNode> rootNodes = BuildNodeHierarchy(av);
+                    // Re-parent every subsequent root's own roots (parentIndex
+                    // == -1) onto nothing but keep them appended, exactly as
+                    // the mesh walk treats independent unreferenced roots as
+                    // siblings -- offsetting each subtree's internal indices
+                    // by the running total so cross-references stay correct.
+                    const int offset = static_cast<int>(nodes.size());
+                    for (SceneNode& n : rootNodes) {
+                        if (n.parentIndex >= 0) {
+                            n.parentIndex += offset;
+                        }
+                    }
+                    nodes.insert(nodes.end(), std::make_move_iterator(rootNodes.begin()),
+                                 std::make_move_iterator(rootNodes.end()));
+                }
+            }
+        }
+        const std::vector<SceneNode>* nodesPtr = nodes.empty() ? nullptr : &nodes;
+
+        const size_t clipsBefore = scene.animations.size();
 
         for (const NiObjectRef& b : blocks) {
             NiObject* obj = static_cast<NiObject*>(b);
@@ -501,17 +543,24 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
                 continue;
             }
             if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
-                animExtractor.ExtractEmbedded(av, skeleton, scene, result.animation);
+                animExtractor.ExtractEmbedded(av, skeleton, nodesPtr, scene, result.animation);
             }
         }
 
         std::string kfPath;
         if (ResolveCompanionKf(nifPath, kfPath)) {
             ++result.animation.kfFilesFound;
-            if (!animExtractor.ExtractFromKf(kfPath, skeleton, scene, result.animation)) {
+            if (!animExtractor.ExtractFromKf(kfPath, skeleton, nodesPtr, scene, result.animation)) {
                 result.warnings.push_back("companion .kf '" + kfPath +
                                           "' could not be parsed; its animations are missing");
             }
+        }
+
+        // Only a file that actually gained a clip while resolving against the
+        // node list needs it exported; every other skeleton-less file (the
+        // large majority, per PHASE4_FINDINGS) keeps scene.nodes empty.
+        if (nodesPtr != nullptr && scene.animations.size() > clipsBefore) {
+            scene.nodes = std::move(nodes);
         }
     }
 

@@ -112,6 +112,7 @@ scene.add(root);
 let mixer = null;
 let activeAction = null;
 let currentClips = [];
+let bindPose = []; // snapshot of every bone's rest pose, restored before each clip starts
 let scrubbing = false; // true while the timeline slider itself is being dragged
 
 addEventListener('resize', () => {
@@ -176,6 +177,30 @@ function buildBones(skel) {
   return { bones, roots };
 }
 
+// A clip only carries tracks for the bones it actually animates -- e.g. a
+// clip with only XYZ_ROTATION_KEY tracks (translation/scale extracted,
+// rotation left empty, see AnimationExtractor) never writes to a bone's
+// quaternion at all. THREE.AnimationAction.stop() halts evaluation but does
+// NOT restore untouched properties, so switching from a clip that moved a
+// bone to one that doesn't touch it leaves that bone's last pose stuck.
+// Resetting every bone to its recorded bind pose before starting a new clip
+// is the only way to guarantee a clean slate each time.
+function snapshotBindPose(bones) {
+  return bones.map(b => ({
+    bone: b,
+    position: b.position.clone(),
+    quaternion: b.quaternion.clone(),
+    scale: b.scale.clone(),
+  }));
+}
+function restoreBindPose(bindPose) {
+  for (const s of bindPose) {
+    s.bone.position.copy(s.position);
+    s.bone.quaternion.copy(s.quaternion);
+    s.bone.scale.copy(s.scale);
+  }
+}
+
 // Reads one channel's {times, values} accessor pair straight out of the
 // shared .gfbin -- same pattern as attr()/attrU16() above, just without
 // wrapping the result in a BufferAttribute since THREE's *KeyframeTrack
@@ -187,19 +212,28 @@ function channelArrays(bin, ch) {
   return { times, values };
 }
 
-// Builds one THREE.AnimationClip per exported AnimationClip, targeting bones
-// by name (".bones[boneName].quaternion" etc, THREE's standard skeletal
-// target path) so the same clip plays on any skeleton that has those bone
-// names -- exactly how the source .kf's own name-based binding works.
-// An orphaned track (boneIndex === -1, no matching bone in this file's
-// skeleton) is skipped: THREE.PropertyBinding would warn on every frame for a
-// path that resolves to nothing, so it is left out rather than passed through.
+// Builds one THREE.AnimationClip per exported AnimationClip.
+//
+// A skinned file's tracks target bones by the ".bones[boneName].quaternion"
+// etc path (THREE's standard skeletal target, resolved against the mixer
+// root's `.skeleton`) -- exactly how the source .kf's own name-based binding
+// works. A skeleton-less file's tracks instead target a plain scene node by
+// its own name ("nodeName.quaternion" etc, no ".bones[]" wrapper): THREE's
+// PropertyBinding falls back to searching the object graph by `.name` for any
+// path that isn't a special-cased ".bones[]"/".materials[]" form, so this
+// needs no skeleton at all -- see SceneData::nodes / the exporter's
+// AnimationTrack doc comment for why a track is never resolved against both.
+// An orphaned track (boneIndex === -1, no matching target found by the
+// exporter in either list) is skipped: THREE.PropertyBinding would warn on
+// every frame for a path that resolves to nothing, so it is left out rather
+// than passed through.
 function buildAnimationClips(model, bin) {
+  const hasSkeleton = (model.skeletons || []).length > 0;
   return (model.animations || []).map(clip => {
     const tracks = [];
     for (const t of clip.tracks) {
       if (t.boneIndex < 0) continue;
-      const name = `.bones[${t.boneName}]`;
+      const name = hasSkeleton ? `.bones[${t.boneName}]` : t.boneName;
 
       const rot = channelArrays(bin, t.rotation);
       if (rot) tracks.push(new THREE.QuaternionKeyframeTrack(name + '.quaternion', rot.times, rot.values));
@@ -222,6 +256,28 @@ function buildAnimationClips(model, bin) {
   });
 }
 
+// Rebuilds one exported node hierarchy (SceneData::nodes -- skeleton-less
+// files only, see the exporter) as a plain THREE.Object3D tree, the same
+// parent-before-child construction buildBones() uses for a THREE.Bone tree.
+// A plain Object3D (not a Bone) is correct here: nothing about these nodes
+// is meant to skin geometry, and PropertyBinding's name search works over
+// any Object3D, not just bones.
+function buildSceneNodes(nodes) {
+  const objs = nodes.map(n => {
+    const obj = new THREE.Object3D();
+    obj.name = n.name;
+    new THREE.Matrix4().fromArray(n.localMatrix)
+      .decompose(obj.position, obj.quaternion, obj.scale);
+    return obj;
+  });
+  const roots = [];
+  nodes.forEach((n, i) => {
+    if (n.parent < 0) roots.push(objs[i]);
+    else objs[n.parent].add(objs[i]);
+  });
+  return { objs, roots };
+}
+
 function buildScene(model, bin, textureUrlFor) {
   const group = new THREE.Group();
   const showTex = document.getElementById('tex').checked;
@@ -241,6 +297,16 @@ function buildScene(model, bin, textureUrlFor) {
     roots.forEach(r => r.updateMatrixWorld(true));
     return { bones, roots, def: s };
   });
+
+  // A skeleton-less file's embedded animation targets these directly (see
+  // buildAnimationClips / buildSceneNodes) -- geometry that carries its own
+  // NiTransformController with no skin anywhere in the file (a rotating
+  // prop, a moving door). Empty for the overwhelming majority of files.
+  const sceneNodeObjs = (model.nodes || []).length ? buildSceneNodes(model.nodes) : null;
+  if (sceneNodeObjs) {
+    sceneNodeObjs.roots.forEach(r => group.add(r));
+    sceneNodeObjs.roots.forEach(r => r.updateMatrixWorld(true));
+  }
 
   for (const m of model.meshes) {
     const g = new THREE.BufferGeometry();
@@ -361,6 +427,16 @@ function buildScene(model, bin, textureUrlFor) {
     }
   }
 
+  // THREE's ".bones[name]" PropertyBinding path (used by buildAnimationClips
+  // below) only resolves against a node that exposes `.skeleton` -- normally
+  // a SkinnedMesh. The mixer here is driven off `group` itself (so one mixer
+  // can animate bones across every skinned mesh sharing a skeleton), so that
+  // skeleton is exposed on `group` too. One skeleton per file, per the
+  // exporter's own rule, so the first is the right one.
+  if (skeletons.length) {
+    group.skeleton = new THREE.Skeleton(skeletons[0].bones);
+  }
+
   // NIF/Gamebryo is Z-up; Three.js is Y-up. The exporter deliberately keeps the
   // source axes (converting is a consumer-side decision, and Phase 3's skeleton
   // has to agree with whatever choice is made), so the viewer rotates for
@@ -370,7 +446,8 @@ function buildScene(model, bin, textureUrlFor) {
   }
 
   const clips = buildAnimationClips(model, bin);
-  return { group, notes, clips };
+  const allBones = skeletons.flatMap(sk => sk.bones).concat(sceneNodeObjs ? sceneNodeObjs.objs : []);
+  return { group, notes, clips, allBones };
 }
 
 function frame(group) {
@@ -406,7 +483,7 @@ function show(model, bin, textureUrlFor) {
     if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
   });
 
-  const { group, notes, clips } = buildScene(model, bin, textureUrlFor);
+  const { group, notes, clips, allBones } = buildScene(model, bin, textureUrlFor);
   root = group;
   scene.add(root);
   frame(root);
@@ -414,6 +491,10 @@ function show(model, bin, textureUrlFor) {
   mixer = clips.length ? new THREE.AnimationMixer(root) : null;
   activeAction = null;
   currentClips = clips;
+  // Captured once per load, after buildBones() has set every bone to its
+  // bind pose and before any clip has run -- see restoreBindPose's use in
+  // playClip.
+  bindPose = snapshotBindPose(allBones);
   setupAnimBar(clips);
 
   const tris = model.meshes.reduce((a, m) => a + m.indexCount / 3, 0);
@@ -503,6 +584,12 @@ function setupAnimBar(clips) {
 
 function playClip(index) {
   if (activeAction) activeAction.stop();
+  // A clip only carries tracks for the bones/channels it actually animates
+  // (e.g. an XYZ_ROTATION_KEY track has no quaternion keys at all -- see
+  // buildAnimationClips). Restoring bind pose here means every bone starts
+  // from a known-good rest state regardless of what the previous clip left
+  // untouched.
+  restoreBindPose(bindPose);
   const clip = currentClips[index];
   document.getElementById('timeline').max = clip.duration;
   document.getElementById('timeline').value = 0;

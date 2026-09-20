@@ -370,6 +370,20 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     }
     js << "  ],\n";
 
+    // Only populated for a skeleton-less file that has an embedded animation
+    // track targeting a plain node -- see SceneData::nodes. Same shape and
+    // parent-before-child ordering as "skeletons" above, minus the
+    // isAttachPoint flag, which is meaningless off a skeleton.
+    js << "  \"nodes\": [\n";
+    for (size_t i = 0; i < scene.nodes.size(); ++i) {
+        const SceneNode& n = scene.nodes[i];
+        js << "    {\"name\": \"" << JsonEscape(n.name) << "\""
+           << ", \"parent\": " << n.parentIndex
+           << ",\n     \"localMatrix\": " << Mat4Json(n.localMatrix) << "}"
+           << (i + 1 < scene.nodes.size() ? "," : "") << "\n";
+    }
+    js << "  ],\n";
+
     // Each channel is {times: accessor, values: accessor, count}, empty
     // (count 0) when the source did not animate that property -- a consumer
     // keeps the bone's bind-pose value in that case. itemSize is baked into

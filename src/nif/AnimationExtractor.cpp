@@ -63,6 +63,31 @@ int FindBoneByName(const SkeletonData* skeleton, const std::string& name) {
     return -1;
 }
 
+int FindNodeByName(const std::vector<SceneNode>* nodes, const std::string& name) {
+    if (nodes == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < nodes->size(); ++i) {
+        if ((*nodes)[i].name == name) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+/*! Resolves a track's target name against whichever of the two a file has --
+ *  see AnimationExtractor.hpp: a file is never both skinned and carrying a
+ *  standalone node list, so exactly one of `skeleton`/`nodes` is non-null in
+ *  practice, but both are tried defensively rather than assuming that. */
+int ResolveTargetIndex(const SkeletonData* skeleton, const std::vector<SceneNode>* nodes,
+                       const std::string& name) {
+    const int boneIndex = FindBoneByName(skeleton, name);
+    if (boneIndex >= 0) {
+        return boneIndex;
+    }
+    return FindNodeByName(nodes, name);
+}
+
 /*! Copies a niflib quaternion {w, x, y, z} into the glTF/Three.js component
  *  order [x, y, z, w], renormalizing in the process.
  *
@@ -101,6 +126,19 @@ void CopyVec3(const Niflib::Vector3& v, float (&out)[3]) {
     out[0] = v.x;
     out[1] = v.y;
     out[2] = v.z;
+}
+
+/*! Writes a niflib Matrix44 into a column-major float[16] -- identical
+ *  convention and transpose to SkeletonExtractor.cpp's ToColumnMajor (kept as
+ *  a separate copy since that one is file-local); see that file's comment for
+ *  the full row-vector/column-major derivation. Used for SceneNode::localMatrix,
+ *  the node-hierarchy equivalent of BoneData::bindMatrixLocal. */
+void ToColumnMajorLocal(const Niflib::Matrix44& m, float (&out)[16]) {
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            out[i * 4 + j] = m[i][j];
+        }
+    }
 }
 
 /*! Reads a NiTransformInterpolator's NiTransformData keys as-is, keeping their
@@ -282,10 +320,54 @@ bool ExtractInterpolator(Niflib::NiInterpolator* interp, AnimationTrack& track,
 
 } // namespace
 
+std::vector<SceneNode> BuildNodeHierarchy(Niflib::NiAVObject* root) {
+    std::vector<SceneNode> nodes;
+    if (root == nullptr) {
+        return nodes;
+    }
+
+    // Same shape as SkeletonExtractor's CollectBones -- see SceneNode -- but
+    // walking NiAVObject rather than NiNode specifically, since a
+    // skeleton-less file's animated target can be any node in the tree, not
+    // only ones with children (a leaf NiTriShape's own NiNode-typed parent
+    // is what SkeletonExtractor would require; this does not need that
+    // restriction because it is never asked to carry child bones' weights).
+    struct Item {
+        Niflib::NiAVObject* obj;
+        int parentIndex;
+    };
+    std::vector<Item> stack{{root, -1}};
+    std::set<Niflib::NiObject*> visited;
+
+    while (!stack.empty()) {
+        Item item = stack.back();
+        stack.pop_back();
+        if (item.obj == nullptr || !visited.insert(item.obj).second) {
+            continue;
+        }
+
+        const int index = static_cast<int>(nodes.size());
+        SceneNode n;
+        n.name = item.obj->GetName();
+        n.parentIndex = item.parentIndex;
+        ToColumnMajorLocal(item.obj->GetLocalTransform(), n.localMatrix);
+        nodes.push_back(std::move(n));
+
+        if (auto* node = dynamic_cast<Niflib::NiNode*>(item.obj)) {
+            for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
+                stack.push_back({static_cast<Niflib::NiAVObject*>(child), index});
+            }
+        }
+    }
+
+    return nodes;
+}
+
 AnimationExtractor::AnimationExtractor(std::vector<std::string>* warnings) : warnings_(warnings) {}
 
 void AnimationExtractor::ExtractEmbedded(Niflib::NiAVObject* root, const SkeletonData* skeleton,
-                                         SceneData& scene, AnimationStats& stats) {
+                                         const std::vector<SceneNode>* nodes, SceneData& scene,
+                                         AnimationStats& stats) {
     if (root == nullptr) {
         return;
     }
@@ -320,7 +402,7 @@ void AnimationExtractor::ExtractEmbedded(Niflib::NiAVObject* root, const Skeleto
 
             AnimationTrack track;
             track.boneName = obj->GetName();
-            track.boneIndex = FindBoneByName(skeleton, track.boneName);
+            track.boneIndex = ResolveTargetIndex(skeleton, nodes, track.boneName);
 
             ++stats.tracksTotal;
             bool genuineFailure = false;
@@ -343,7 +425,8 @@ void AnimationExtractor::ExtractEmbedded(Niflib::NiAVObject* root, const Skeleto
                 ++stats.tracksOrphaned;
                 if (warnings_ != nullptr) {
                     warnings_->push_back("embedded animation track targets '" + track.boneName +
-                                        "', not found in the file's skeleton");
+                                        "', not found in the file's " +
+                                        (skeleton != nullptr ? "skeleton" : "node hierarchy"));
                 }
             }
             if (ScaleActuallyAnimates(track.scales)) {
@@ -372,7 +455,8 @@ void AnimationExtractor::ExtractEmbedded(Niflib::NiAVObject* root, const Skeleto
 }
 
 bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const SkeletonData* skeleton,
-                                       SceneData& scene, AnimationStats& stats) {
+                                       const std::vector<SceneNode>* nodes, SceneData& scene,
+                                       AnimationStats& stats) {
     std::string bytes;
     if (!ReadWholeFile(kfPath, bytes)) {
         return false;
@@ -432,7 +516,7 @@ bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const Skeleton
 
             AnimationTrack track;
             track.boneName = link.nodeName;
-            track.boneIndex = FindBoneByName(skeleton, track.boneName);
+            track.boneIndex = ResolveTargetIndex(skeleton, nodes, track.boneName);
 
             ++stats.tracksTotal;
             const std::string context =
@@ -455,8 +539,9 @@ bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const Skeleton
             } else {
                 ++stats.tracksOrphaned;
                 if (warnings_ != nullptr) {
-                    warnings_->push_back(context + ": bone not found in the model's skeleton; " +
-                                        "track kept orphaned (boneIndex = -1)");
+                    warnings_->push_back(context + ": target not found in the model's " +
+                                        (skeleton != nullptr ? "skeleton" : "node hierarchy") +
+                                        "; track kept orphaned (boneIndex = -1)");
                 }
             }
             if (ScaleActuallyAnimates(track.scales)) {
