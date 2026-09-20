@@ -162,7 +162,21 @@ def main():
             
             print(f"  → Import du fichier NIF...")
             try:
-                bpy.ops.import_scene.nif(filepath=nif_path, animation=False)
+                # Force the import to keep the NIF's own native Z-up frame and
+                # units (axis_forward='Z', axis_up='Y' is the identity remap
+                # for a Z-up source; the addon's default is axis_up='-Y' with
+                # a 0.1 scale_correction, i.e. Blender's own Y-up/meters
+                # convention). Keeping the native frame here means the .obj
+                # this script exports needs no axis/scale correction at all
+                # to compare directly against the C++ exporter's own output,
+                # which also stays in native Z-up NIF units throughout.
+                bpy.ops.import_scene.nif(
+                    filepath=nif_path,
+                    animation=False,
+                    axis_forward='Z',
+                    axis_up='Y',
+                    scale_correction=1.0,
+                )
             except Exception as import_error:
                 print(f"  ⚠ Erreur d'import partielle: {str(import_error)}")
                 # Continue quand même si des meshes ont été importés
@@ -188,19 +202,46 @@ def main():
             print(f"  → Mesh: {vertex_count} vertices, taille max: {max_dimension:.3f}")
             
             print(f"  → Export OBJ...")
-            bpy.ops.export_scene.obj(
-                filepath=obj_output_path,
-                use_selection=True,
-                use_materials=False,
-                use_triangles=False,
-                use_normals=True,
-                use_uvs=True,
-                keep_vertex_order=True,
-                axis_forward='-Z',
-                axis_up='Y',
-                global_scale=1.0,
-                path_mode='AUTO'
-            )
+            # Blender 5.x removed the legacy export_scene.obj operator in favor
+            # of wm.obj_export, which renames every parameter (axis_forward ->
+            # forward_axis with 'NEGATIVE_Z'/'Y' enum values instead of '-Z'/'Y',
+            # use_selection -> export_selected_objects, etc). Try the modern
+            # operator first since that's what every Blender this project has
+            # been run against (5.2 LTS) actually exposes; fall back to the
+            # legacy one for older Blenders that still ship it.
+            # Identity axis remap on export too (forward='Y', up='Z' is
+            # Wavefront OBJ's own "no change" baseline for a Y-forward/Z-up
+            # scene) -- combined with the identity-remap import above, the
+            # .obj this produces is in the exact same native Z-up, unscaled
+            # frame as the C++ exporter's .gfmodel/.gfbin output, so
+            # tools/diag/compare_orientation.js needs no inverse transform.
+            if hasattr(bpy.ops.wm, "obj_export"):
+                bpy.ops.wm.obj_export(
+                    filepath=obj_output_path,
+                    export_selected_objects=True,
+                    export_materials=False,
+                    export_triangulated_mesh=False,
+                    export_normals=True,
+                    export_uv=True,
+                    forward_axis='Y',
+                    up_axis='Z',
+                    global_scale=1.0,
+                    path_mode='AUTO'
+                )
+            else:
+                bpy.ops.export_scene.obj(
+                    filepath=obj_output_path,
+                    use_selection=True,
+                    use_materials=False,
+                    use_triangles=False,
+                    use_normals=True,
+                    use_uvs=True,
+                    keep_vertex_order=True,
+                    axis_forward='Y',
+                    axis_up='Z',
+                    global_scale=1.0,
+                    path_mode='AUTO'
+                )
             
             if os.path.exists(obj_output_path):
                 file_size = os.path.getsize(obj_output_path)

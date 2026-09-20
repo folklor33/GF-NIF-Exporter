@@ -1,0 +1,205 @@
+{
+  "B2A02": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "C006": {
+    "verdict": "OK",
+    "boneCount": 14,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L11",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "C017": {
+    "verdict": "OK",
+    "boneCount": 6,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L11",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "G00005": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "M005": {
+    "verdict": "OK",
+    "boneCount": 47,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "Bip01",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M009": {
+    "verdict": "OK",
+    "boneCount": 70,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L12",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M011": {
+    "verdict": "OK",
+    "boneCount": 38,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "Bip01",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M015": {
+    "verdict": "OK",
+    "boneCount": 46,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L11",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M017": {
+    "verdict": "OK",
+    "boneCount": 46,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L12",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M028": {
+    "verdict": "OK",
+    "boneCount": 49,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "Bip01",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "M389": {
+    "verdict": "OK",
+    "boneCount": 74,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "L11",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "N005": {
+    "verdict": "OK",
+    "boneCount": 47,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "Bip01",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "N015": {
+    "verdict": "OK",
+    "boneCount": 55,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "Bip01",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "R005": {
+    "verdict": "OK",
+    "boneCount": 88,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "R003",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "R025": {
+    "verdict": "OK",
+    "boneCount": 76,
+    "badBoneCount": 0,
+    "worstBone": {
+      "name": "R023",
+      "dist": 0
+    },
+    "badBones": [],
+    "onlyInRef": [],
+    "onlyInExp": [
+      "Scene Root"
+    ]
+  },
+  "S13103": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "W105": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "WA85": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "X1005": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  },
+  "X1052": {
+    "verdict": "NO_REFERENCE_ARMATURE"
+  }
+}

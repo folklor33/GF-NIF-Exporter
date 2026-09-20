@@ -1,0 +1,456 @@
+{
+  "B2A02": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.00022070502885863298,
+    "anyAxisTrusted": true,
+    "refSize": [
+      0.347038,
+      0.340742,
+      0.321
+    ],
+    "expSize": [
+      0.3470379114151001,
+      0.3407422602176666,
+      0.3210003972053528
+    ],
+    "maxDimRatioErr": 0.0000012373983217271549,
+    "refAsym": -0.1069182389937107,
+    "expAsym": 0.006289308176100629,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 159,
+    "gfVerts": 159
+  },
+  "C006": {
+    "verdict": "SCALE_MISMATCH",
+    "reasons": [
+      "dimension ratio mismatch 62%",
+      "no PCA axis well-separated in both clouds; rotation check skipped (shape too symmetric/boxy)"
+    ],
+    "maxAxisAngle": 0,
+    "anyAxisTrusted": false,
+    "refSize": [
+      1.319828,
+      1.92644,
+      1.270692
+    ],
+    "expSize": [
+      0.9800828467312711,
+      0.7309626340866089,
+      0.9998136381640671
+    ],
+    "maxDimRatioErr": 0.6205629897185436,
+    "refAsym": -0.03718010622887494,
+    "expAsym": 0.10067114093959731,
+    "skippedReattached": 0,
+    "meshCount": 16,
+    "objVerts": 2071,
+    "gfVerts": 1788
+  },
+  "C017": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 8.537736462515939e-7,
+    "anyAxisTrusted": true,
+    "refSize": [
+      3.408224,
+      2.677252,
+      2.020773
+    ],
+    "expSize": [
+      3.408224582672119,
+      2.6772515773773193,
+      2.0207730531692505
+    ],
+    "maxDimRatioErr": 1.7096059982687244e-7,
+    "refAsym": -0.4052932018681889,
+    "expAsym": -0.4052932018681889,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 1927,
+    "gfVerts": 1927
+  },
+  "G00005": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.00014025035084567648,
+    "anyAxisTrusted": true,
+    "refSize": [
+      0.901412,
+      0.692934,
+      0.685402
+    ],
+    "expSize": [
+      0.9014110565185547,
+      0.6929341554641724,
+      0.6854016780853271
+    ],
+    "maxDimRatioErr": 0.0000010466706071180993,
+    "refAsym": 0.2413793103448276,
+    "expAsym": 0.2413793103448276,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 58,
+    "gfVerts": 58
+  },
+  "M005": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 3.2953899790225063,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.077012,
+      0.433456,
+      1.462993
+    ],
+    "expSize": [
+      0.7523320849586903,
+      0.6042665965050322,
+      1.3504566055997735
+    ],
+    "maxDimRatioErr": 0.30146360025822344,
+    "refAsym": -0.1928374655647383,
+    "expAsym": -0.15151515151515152,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 726,
+    "gfVerts": 726
+  },
+  "M009": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 2.5113707832659284,
+    "anyAxisTrusted": true,
+    "refSize": [
+      5.037292,
+      1.351728,
+      2.03472
+    ],
+    "expSize": [
+      3.436109681251298,
+      1.9590232507095382,
+      1.544195212444844
+    ],
+    "maxDimRatioErr": 0.3178656942557036,
+    "refAsym": 0.016597510373443983,
+    "expAsym": -0.0995850622406639,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 482,
+    "gfVerts": 482
+  },
+  "M011": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 2.0058252875089044,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.01387,
+      1.239056,
+      1.816709
+    ],
+    "expSize": [
+      0.9944790273641824,
+      1.2290132235446185,
+      1.8384326024963005
+    ],
+    "maxDimRatioErr": 0.019125699188079024,
+    "refAsym": -0.07979626485568761,
+    "expAsym": -0.07640067911714771,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 589,
+    "gfVerts": 589
+  },
+  "M015": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.05259517915130034,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.7817,
+      2.252072,
+      3.054904
+    ],
+    "expSize": [
+      1.7786416035757084,
+      2.2474711843538424,
+      3.0503432246975004
+    ],
+    "maxDimRatioErr": 0.0020429256463193285,
+    "refAsym": 0.1073558648111332,
+    "expAsym": 0.1073558648111332,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 1006,
+    "gfVerts": 1006
+  },
+  "M017": {
+    "verdict": "SCALE_MISMATCH",
+    "reasons": [
+      "dimension ratio mismatch 44%"
+    ],
+    "maxAxisAngle": 5.808176805388029,
+    "anyAxisTrusted": true,
+    "refSize": [
+      2.525734,
+      10.11553,
+      1.855388
+    ],
+    "expSize": [
+      4.508672640993473,
+      8.531129186825893,
+      1.8463456490880432
+    ],
+    "maxDimRatioErr": 0.43980541478312746,
+    "refAsym": 0.05149700598802395,
+    "expAsym": 0.0011976047904191617,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 835,
+    "gfVerts": 835
+  },
+  "M028": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 8.365613937484191,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.538552,
+      4.209052,
+      2.369053
+    ],
+    "expSize": [
+      1.5483263210780438,
+      3.857012875301992,
+      2.340240891469684
+    ],
+    "maxDimRatioErr": 0.08363857816392098,
+    "refAsym": -0.2545824847250509,
+    "expAsym": -0.2505091649694501,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 491,
+    "gfVerts": 491
+  },
+  "M389": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.05229376497509583,
+    "anyAxisTrusted": true,
+    "refSize": [
+      2.17134,
+      3.43486,
+      2.515811
+    ],
+    "expSize": [
+      2.166201086615737,
+      3.4264402523506434,
+      2.512254260448042
+    ],
+    "maxDimRatioErr": 0.0024512637048836345,
+    "refAsym": -0.07608299963596651,
+    "expAsym": -0.07753913360029123,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 2747,
+    "gfVerts": 2747
+  },
+  "N005": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.05510919328486577,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.141436,
+      0.599316,
+      1.845165
+    ],
+    "expSize": [
+      1.138809230628042,
+      0.5973307436678791,
+      1.8427957674675275
+    ],
+    "maxDimRatioErr": 0.0033125368455387094,
+    "refAsym": -0.0529595015576324,
+    "expAsym": -0.0529595015576324,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 963,
+    "gfVerts": 963
+  },
+  "N015": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.06674754529694847,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.31677,
+      0.870962,
+      2.428321
+    ],
+    "expSize": [
+      1.3133593853496106,
+      0.8704933869857197,
+      2.4254123397553013
+    ],
+    "maxDimRatioErr": 0.0025901369642301903,
+    "refAsym": -0.05649717514124294,
+    "expAsym": -0.05367231638418079,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 708,
+    "gfVerts": 708
+  },
+  "R005": {
+    "verdict": "ROTATED+SCALE_MISMATCH",
+    "reasons": [
+      "principal axis misaligned by 78.9 deg",
+      "dimension ratio mismatch 51%"
+    ],
+    "maxAxisAngle": 78.90999678020339,
+    "anyAxisTrusted": true,
+    "refSize": [
+      2.898668,
+      1.473786,
+      3.001612
+    ],
+    "expSize": [
+      1.471009260589796,
+      2.9944027805936706,
+      2.895193229442397
+    ],
+    "maxDimRatioErr": 0.5078197196611582,
+    "refAsym": -0.166044776119403,
+    "expAsym": 0.061567164179104475,
+    "skippedReattached": 0,
+    "meshCount": 2,
+    "objVerts": 2144,
+    "gfVerts": 2144
+  },
+  "R025": {
+    "verdict": "ROTATED",
+    "reasons": [
+      "principal axis misaligned by 87.5 deg"
+    ],
+    "maxAxisAngle": 87.48508930558452,
+    "anyAxisTrusted": true,
+    "refSize": [
+      3.0719890000000003,
+      2.78102,
+      3.081873
+    ],
+    "expSize": [
+      2.775467476507331,
+      3.0774347873625865,
+      3.0682456775849003
+    ],
+    "maxDimRatioErr": 0.09652427905590465,
+    "refAsym": -0.11456859971711457,
+    "expAsym": -0.13295615275813297,
+    "skippedReattached": 0,
+    "meshCount": 2,
+    "objVerts": 2828,
+    "gfVerts": 2828
+  },
+  "S13103": {
+    "verdict": "NO_COMPARABLE_GEOMETRY",
+    "skippedReattached": 9,
+    "meshCount": 9
+  },
+  "W105": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.000007778248095798993,
+    "anyAxisTrusted": true,
+    "refSize": [
+      0.389052,
+      1.43352,
+      0.103964
+    ],
+    "expSize": [
+      0.38905271887779236,
+      1.4335208386182785,
+      0.10396379604935646
+    ],
+    "maxDimRatioErr": 0.000001961742945060645,
+    "refAsym": 0.5217391304347826,
+    "expAsym": 0.5217391304347826,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 92,
+    "gfVerts": 92
+  },
+  "WA85": {
+    "verdict": "SCALE_MISMATCH",
+    "reasons": [
+      "dimension ratio mismatch 96%"
+    ],
+    "maxAxisAngle": 1.8376366067080614,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.352056,
+      1.607398,
+      2.130897
+    ],
+    "expSize": [
+      1.3520561456680298,
+      2.130896747112274,
+      0.09186351671814919
+    ],
+    "maxDimRatioErr": 0.9568897432779955,
+    "refAsym": 0.2047872340425532,
+    "expAsym": 0.43169398907103823,
+    "skippedReattached": 2,
+    "meshCount": 4,
+    "objVerts": 752,
+    "gfVerts": 366
+  },
+  "X1005": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.000020526110585337575,
+    "anyAxisTrusted": true,
+    "refSize": [
+      0.55423,
+      0.31158,
+      0.190205
+    ],
+    "expSize": [
+      0.5542308688163757,
+      0.311579130589962,
+      0.1902046650648117
+    ],
+    "maxDimRatioErr": 0.0000027903268438859764,
+    "refAsym": 0.10416666666666667,
+    "expAsym": 0.10416666666666667,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 384,
+    "gfVerts": 384
+  },
+  "X1052": {
+    "verdict": "OK",
+    "reasons": [],
+    "maxAxisAngle": 0.000024298823955437425,
+    "anyAxisTrusted": true,
+    "refSize": [
+      1.111416,
+      0.964878,
+      0.835354
+    ],
+    "expSize": [
+      1.1114163398742676,
+      0.96487757563591,
+      0.8353542238473892
+    ],
+    "maxDimRatioErr": 4.398111367232507e-7,
+    "refAsym": -0.07692307692307693,
+    "expAsym": -0.07692307692307693,
+    "skippedReattached": 0,
+    "meshCount": 1,
+    "objVerts": 130,
+    "gfVerts": 130
+  }
+}

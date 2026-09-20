@@ -1,0 +1,29 @@
+# Fixed sample list for the visual-orientation validation harness.
+# One relative path (from the corpus "input" root) per line, "#" comments
+# and blank lines ignored. Written once and committed -- NOT regenerated
+# per run, so every harness run judges the exact same files (see the
+# phase4-followup plan, step 2.1).
+#
+# Named test cases (explicitly reported problems/known-good references):
+monster/model/M009.nif
+monster/model/M011.nif
+monster/model/M017.nif
+monster/model/M028.nif
+monster/model/M389.nif
+item/model/WA85.nif
+#
+# Fixed random sample, two per entity type, spanning the corpus:
+chair/model/C006.nif
+chair/model/C017.nif
+char/model/B2A02.nif
+effect/model/S13103.nif
+elf/model/X1005.nif
+elf/model/X1052.nif
+item/model/G00005.nif
+item/model/W105.nif
+monster/model/M005.nif
+monster/model/M015.nif
+npc/model/N005.nif
+npc/model/N015.nif
+ride/model/R005.nif
+ride/model/R025.nif
