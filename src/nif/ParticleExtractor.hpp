@@ -51,10 +51,17 @@ public:
      *  skeleton-less, with or without a companion .kf).
      *
      *  A system whose own emitter type is not recognised, or whose data
-     *  block is missing, is skipped with a warning -- never fails the file. */
+     *  block is missing, is skipped with a warning -- never fails the file.
+     *
+     *  `geometryIndex` maps each NiAVObject the mesh walk exported to where it
+     *  landed, so a NiPSysMeshEmitter's block links resolve to an unambiguous
+     *  array index rather than to a name several meshes share -- see
+     *  MeshEmitterRef and docs/PHASE7_FINDINGS.md 6.2. Passing nullptr keeps
+     *  the names but leaves every MeshEmitterRef at -1. */
     void Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                  const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
-                 SceneData& scene, ParticleStats& stats);
+                 SceneData& scene, ParticleStats& stats,
+                 const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex = nullptr);
 
     /*! Scans every NiPSysMeshEmitter reachable from `blocks` and returns the
      *  set of geometry names its meshEmitterMeshNames reference.

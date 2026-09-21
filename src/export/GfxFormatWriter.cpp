@@ -267,7 +267,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::ostringstream js;
     js << "{\n";
     js << "  \"formatVersion\": " << kGfModelFormatVersion << ",\n";
-    js << "  \"generator\": \"gfnif-export (phase 5)\",\n";
+    js << "  \"generator\": \"gfnif-export (phase 7 correctif)\",\n";
     js << "  \"sourceNif\": \"" << JsonEscape(scene.sourceNifPath) << "\",\n";
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
@@ -502,6 +502,27 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "        \"meshEmitterMeshNames\": [";
         for (size_t m = 0; m < e.meshEmitterMeshNames.size(); ++m) {
             js << (m ? ", " : "") << "\"" << JsonEscape(e.meshEmitterMeshNames[m]) << "\"";
+        }
+        js << "],\n";
+        // The reference a consumer actually resolves: entry i is the same
+        // reference meshEmitterMeshNames[i] names, but as an array index the
+        // .nif's own block link supplies. See MeshEmitterRef for why the name
+        // cannot be used for this.
+        js << "        \"meshEmitterMeshes\": [";
+        for (size_t m = 0; m < e.meshEmitterMeshes.size(); ++m) {
+            const MeshEmitterRef& ref = e.meshEmitterMeshes[m];
+            js << (m ? ", " : "") << "{\"index\": " << ref.index << ", \"array\": \""
+               << (ref.inEmitterMeshes ? "emitterMeshes" : "meshes") << "\"}";
+        }
+        js << "],\n";
+        // Particles per second, from the system's NiPSysEmitterCtlr, or -1
+        // when the file does not state it -- never an inferred value. See
+        // ParticleEmitterData::birthRate.
+        js << "        \"birthRate\": " << Num(e.birthRate) << ",\n";
+        js << "        \"birthRateKeys\": [";
+        for (size_t k = 0; k < e.birthRateKeys.size(); ++k) {
+            js << (k ? ", " : "") << "{\"time\": " << Num(e.birthRateKeys[k].time)
+               << ", \"value\": " << Num(e.birthRateKeys[k].value) << "}";
         }
         js << "],\n";
         js << "        \"emitterObjectNodeIndex\": " << e.emitterObjectNodeIndex << "\n";

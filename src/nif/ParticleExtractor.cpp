@@ -11,8 +11,13 @@
 #include "obj/NiPSysBoxEmitter.h"
 #include "obj/NiPSysColorModifier.h"
 #include "obj/NiPSysData.h"
+#include "obj/NiFloatData.h"
+#include "obj/NiFloatInterpolator.h"
+#include "obj/NiInterpolator.h"
 #include "obj/NiPSysEmitter.h"
+#include "obj/NiPSysEmitterCtlr.h"
 #include "obj/NiPSysGravityModifier.h"
+#include "obj/NiTimeController.h"
 #include "obj/NiPSysGrowFadeModifier.h"
 #include "obj/NiPSysMeshEmitter.h"
 #include "obj/NiPSysModifier.h"
@@ -276,6 +281,58 @@ Niflib::NiAVObject* FindPtrObject(NiObject* obj) {
     return nullptr;
 }
 
+/*! Reads the birth rate the NiPSysEmitterCtlr on `ps` drives into `out`.
+ *
+ *  The birth rate is not a NiPSysEmitter field at this NIF version -- niflib's
+ *  generated NiPSysEmitter::asString() prints Speed through Life Span
+ *  Variation and nothing else, so the asString() route every other emitter
+ *  scalar takes has nothing to read (docs/PHASE7_FINDINGS.md 6.1 named the
+ *  gap correctly but placed it on the wrong block). Gamebryo drives the rate
+ *  from a NiPSysEmitterCtlr on the particle system instead, and that
+ *  controller's interpolator IS reachable through real typed getters
+ *  (NiSingleInterpController::GetInterpolator), so no text parsing is needed
+ *  here at all.
+ *
+ *  Measured corpus-wide before this was written (tools/diag/measure_phase7.cpp):
+ *  every one of the 6966 systems carries such a controller, 4768 of them with
+ *  a NiFloatInterpolator to read; the remaining 2198 have neither
+ *  interpolator nor data block, and keep birthRate at -1 rather than being
+ *  given an invented value. */
+void ExtractBirthRate(Niflib::NiParticleSystem* ps, ParticleEmitterData& out,
+                      ParticleStats& stats) {
+    for (const Niflib::Ref<Niflib::NiTimeController>& c : ps->GetControllers()) {
+        if (c == NULL) continue;
+        auto* ctlr = dynamic_cast<Niflib::NiPSysEmitterCtlr*>(static_cast<NiObject*>(c));
+        if (ctlr == nullptr) continue;
+
+        Niflib::Ref<Niflib::NiInterpolator> interp = ctlr->GetInterpolator();
+        auto* fi =
+            interp == NULL
+                ? nullptr
+                : dynamic_cast<Niflib::NiFloatInterpolator*>(static_cast<NiObject*>(interp));
+        if (fi == nullptr) continue;
+
+        Niflib::Ref<Niflib::NiFloatData> data = fi->GetData();
+        if (data != NULL) {
+            for (const Niflib::Key<float>& k : data->GetKeys()) {
+                ParticleFloatKey key;
+                key.time = k.time;
+                key.value = k.data;
+                out.birthRateKeys.push_back(key);
+            }
+        }
+        // A keyed controller's NiFloatInterpolator carries no standalone
+        // value (niflib leaves it at its default when a data block is
+        // present), so the first key is the authored starting rate. See
+        // ParticleEmitterData::birthRateKeys.
+        out.birthRate = out.birthRateKeys.empty() ? fi->GetFloatValue()
+                                                  : out.birthRateKeys.front().value;
+        ++stats.birthRateResolved;
+        return;
+    }
+    ++stats.birthRateAbsent;
+}
+
 } // namespace
 
 ParticleExtractor::ParticleExtractor(std::vector<std::string>* warnings) : warnings_(warnings) {}
@@ -304,7 +361,8 @@ std::set<std::string> ParticleExtractor::CollectMeshEmitterNames(
 
 void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                                 const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
-                                SceneData& scene, ParticleStats& stats) {
+                                SceneData& scene, ParticleStats& stats,
+                                const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex) {
     if (root == nullptr) return;
 
     // Collect every NiParticleSystem reachable from `root`, the same
@@ -395,6 +453,25 @@ void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* sk
                         if (auto* geo = dynamic_cast<Niflib::NiTriBasedGeom*>(static_cast<NiObject*>(mr))) {
                             e.meshEmitterMeshNames.push_back(geo->GetName());
                             ++stats.meshEmitterNameRefs;
+
+                            // The ref IS the geometry block -- no name lookup,
+                            // no ambiguity. geometryIndex says where the mesh
+                            // walk put that exact object. A ref the walk
+                            // dropped (helper gizmo, no usable data block)
+                            // leaves the default -1, which is the same
+                            // "reference the export cannot serve" case format
+                            // 3 already reported by name. See MeshEmitterRef.
+                            MeshEmitterRef ref;
+                            if (geometryIndex != nullptr) {
+                                auto it = geometryIndex->find(geo);
+                                if (it != geometryIndex->end()) ref = it->second;
+                            }
+                            if (ref.index >= 0) {
+                                ++stats.meshEmitterRefsIndexed;
+                            } else {
+                                ++stats.meshEmitterRefsIndexUnresolved;
+                            }
+                            e.meshEmitterMeshes.push_back(ref);
                         }
                     }
                     ++stats.emittersMesh;
@@ -421,6 +498,10 @@ void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* sk
                 if (e.emitterObjectNodeIndex < 0) {
                     e.emitterObjectNodeIndex = data.attachNodeIndex;
                 }
+
+                // Emission density, off the system's own controller chain
+                // rather than off the emitter block -- see ExtractBirthRate.
+                ExtractBirthRate(ps, e, stats);
                 continue;
             }
 

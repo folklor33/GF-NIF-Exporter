@@ -452,6 +452,19 @@ struct ParticleStats {
      *  warning, never a failure. */
     int meshEmitterNameRefsUnresolved = 0;
 
+    /*! Phase 7 correctif: of meshEmitterNameRefs, how many resolved to a real
+     *  array index by block identity (MeshEmitterRef), and how many the
+     *  referenced shape was absent from both exported arrays for. The second
+     *  number is the honest residue -- a reference the export genuinely
+     *  cannot serve -- as opposed to the name-based ambiguity it replaces. */
+    int meshEmitterRefsIndexed = 0;
+    int meshEmitterRefsIndexUnresolved = 0;
+    /*! Emitters whose NiPSysEmitterCtlr yielded an authored birth rate, and
+     *  those where the controller carried no interpolator at all (the value
+     *  is genuinely absent from the file -- see ParticleEmitterData::birthRate). */
+    int birthRateResolved = 0;
+    int birthRateAbsent = 0;
+
     void Merge(const ParticleStats& o) {
         filesWithParticles += o.filesWithParticles;
         systemsTotal += o.systemsTotal;
@@ -473,6 +486,10 @@ struct ParticleStats {
         meshEmitterNameRefs += o.meshEmitterNameRefs;
         meshEmitterNameRefsHiddenKept += o.meshEmitterNameRefsHiddenKept;
         meshEmitterNameRefsUnresolved += o.meshEmitterNameRefsUnresolved;
+        meshEmitterRefsIndexed += o.meshEmitterRefsIndexed;
+        meshEmitterRefsIndexUnresolved += o.meshEmitterRefsIndexUnresolved;
+        birthRateResolved += o.birthRateResolved;
+        birthRateAbsent += o.birthRateAbsent;
     }
 };
 
@@ -549,6 +566,34 @@ struct ParticleColorKey {
     float value[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 };
 
+/*! One scalar keyframe of a particle-system curve: a time in seconds and a
+ *  single value. Used by ParticleEmitterData::birthRateKeys. */
+struct ParticleFloatKey {
+    float time = 0.0f;
+    float value = 0.0f;
+};
+
+/*! An unambiguous reference to one of a NiPSysMeshEmitter's emission surfaces.
+ *
+ *  Replaces the name-based reference ParticleEmitterData::meshEmitterMeshNames
+ *  carried through format version 3. Names do not identify a mesh: 4106 of the
+ *  corpus's 6111 mesh-emitter references (67.2%) name a shape whose name is
+ *  shared by another mesh of genuinely different geometry -- `chair/C004` has
+ *  eight meshes all named "Editable Poly" (docs/PHASE7_FINDINGS.md 6.2). A
+ *  consumer resolving by name emits from an arbitrary one of them, i.e. from
+ *  the wrong place and in the wrong direction.
+ *
+ *  The .nif itself is never ambiguous: NiPSysMeshEmitter references its
+ *  meshes by block link, and the exporter walks those links. This carries that
+ *  identity through: `index` into SceneData::emitterMeshes when
+ *  `inEmitterMeshes`, into SceneData::meshes otherwise. -1 means the referenced
+ *  shape is in neither array (dropped by the helper-gizmo filter, or it had no
+ *  usable data block) -- the same case format 3 reported as an unresolved name. */
+struct MeshEmitterRef {
+    int index = -1;
+    bool inEmitterMeshes = false;
+};
+
 /*! One particle emitter. Every NiParticleSystem in the corpus has exactly one
  *  emitter (measured, see PHASE5_FINDINGS Etape 1) so this is not a vector.
  *
@@ -578,6 +623,31 @@ struct ParticleEmitterData {
     float lifeSpan = 0.0f;
     float lifeSpanVariation = 0.0f;
 
+    /*! Particles emitted per second, or -1 when the source does not state it.
+     *
+     *  NOT a NiPSysEmitter field: at this NIF version (20.2.0.8) niflib's
+     *  generated NiPSysEmitter prints no such field, and reading nif.xml's
+     *  layout confirms there is none -- docs/PHASE7_FINDINGS.md 6.1 was
+     *  right that the value is missing but wrong about where it lives. The
+     *  birth rate is the value the NiPSysEmitterCtlr attached to the
+     *  NiParticleSystem drives, through its NiFloatInterpolator.
+     *
+     *  Measured corpus-wide (tools/diag/measure_phase7.cpp): all 6966 systems
+     *  carry a NiPSysEmitterCtlr; 4768 (68.4%) have a NiFloatInterpolator to
+     *  read (4686 a constant value, 82 a keyed timeline), and 2198 have
+     *  neither an interpolator nor a data block -- those keep -1, and a
+     *  consumer falls back to its own estimate as it did before. Range on the
+     *  readable ones: 0 to 4500, mean 68.3 particles/second. */
+    float birthRate = -1.0f;
+    /*! The birth rate's own timeline when the controller's interpolator
+     *  carried NiFloatData keys rather than a single constant (82 systems
+     *  corpus-wide). `time` is in seconds along the controller's timeline,
+     *  not normalised. Empty for a constant rate, in which case `birthRate`
+     *  alone describes the emission; when non-empty, `birthRate` holds the
+     *  first key's value so a consumer that ignores the curve still gets an
+     *  authored number rather than an inference. */
+    std::vector<ParticleFloatKey> birthRateKeys;
+
     // --- NiPSysBoxEmitter fields (type == "NiPSysBoxEmitter") ---
     float boxWidth = 0.0f;
     float boxHeight = 0.0f;
@@ -589,10 +659,17 @@ struct ParticleEmitterData {
     int meshInitialVelocityType = 0;
     int meshEmissionType = 0;
     float meshEmissionAxis[3] = {1.0f, 0.0f, 0.0f};
-    /*! Names of the NiTriShape/NiTriStrips this emitter emits from, kept for
-     *  diagnostics -- a consumer emits from the *attached* geometry's own
-     *  exported mesh, not from this list directly. */
+    /*! Names of the NiTriShape/NiTriStrips this emitter emits from.
+     *
+     *  Kept for diagnostics and for reading an export by eye. A consumer must
+     *  NOT resolve an emission surface through this list: a name does not
+     *  identify a mesh (see MeshEmitterRef). Parallel to meshEmitterMeshes --
+     *  entry i of each describes the same reference. */
     std::vector<std::string> meshEmitterMeshNames;
+    /*! The same references, resolved to an array index by block identity --
+     *  what a consumer actually emits from. Format version 4. See
+     *  MeshEmitterRef. */
+    std::vector<MeshEmitterRef> meshEmitterMeshes;
 
     /*! Index into SceneData::skeletons[skeletonIndex].bones or
      *  SceneData::nodes (whichever the owning ParticleSystemData resolves

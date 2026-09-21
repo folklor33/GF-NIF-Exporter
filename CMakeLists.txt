@@ -124,3 +124,20 @@ if(MSVC)
     set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                  PROPERTY VS_STARTUP_PROJECT gfnif-export)
 endif()
+
+# ---------------------------------------------------------------------------
+# tools/diag -- one-off corpus measurement probes.
+#
+# These are not part of the conversion pipeline; each answers a specific
+# question a phase's findings document then records. They are built on demand:
+#   cmake --build build --config Release --target measure-phase7
+# ---------------------------------------------------------------------------
+add_executable(measure-phase7 EXCLUDE_FROM_ALL
+    tools/diag/measure_phase7.cpp
+    src/nif/HeaderNormalizer.cpp
+)
+target_include_directories(measure-phase7 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(measure-phase7 PRIVATE niflib_static)
+if(MSVC)
+    target_compile_options(measure-phase7 PRIVATE /permissive-)
+endif()

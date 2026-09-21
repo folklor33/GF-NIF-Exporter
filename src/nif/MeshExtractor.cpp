@@ -172,7 +172,11 @@ void WalkNode(Niflib::NiAVObject* obj,
               int depth,
               bool verifyStrips,
               const std::set<std::string>* emitterMeshNames = nullptr,
-              std::vector<Niflib::NiAVObject*>* meshSourceObjects = nullptr) {
+              std::vector<Niflib::NiAVObject*>* meshSourceObjects = nullptr,
+              // Phase 7 correctif: records where each exported shape landed,
+              // so a NiPSysMeshEmitter's block link resolves to an array index
+              // instead of to a name several meshes share. See MeshEmitterRef.
+              std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex = nullptr) {
     if (obj == nullptr || !visited.insert(obj).second) {
         return;
     }
@@ -194,7 +198,8 @@ void WalkNode(Niflib::NiAVObject* obj,
     if (auto* node = dynamic_cast<Niflib::NiNode*>(obj)) {
         for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
             WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, skeletons,
-                     visited, result, depth + 1, verifyStrips, emitterMeshNames, meshSourceObjects);
+                     visited, result, depth + 1, verifyStrips, emitterMeshNames, meshSourceObjects,
+                     geometryIndex);
         }
         return;
     }
@@ -369,10 +374,17 @@ void WalkNode(Niflib::NiAVObject* obj,
     }
 
     if (isEmitterSurface) {
+        if (geometryIndex != nullptr) {
+            (*geometryIndex)[obj] = MeshEmitterRef{static_cast<int>(scene.emitterMeshes.size()),
+                                                   true};
+        }
         scene.emitterMeshes.push_back(std::move(mesh));
         return;
     }
 
+    if (geometryIndex != nullptr) {
+        (*geometryIndex)[obj] = MeshEmitterRef{static_cast<int>(scene.meshes.size()), false};
+    }
     scene.meshes.push_back(std::move(mesh));
     if (meshSourceObjects != nullptr) {
         meshSourceObjects->push_back(obj);
@@ -483,6 +495,12 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
     // (names collide routinely, e.g. WA85's three "Editable Mesh" siblings).
     std::vector<Niflib::NiAVObject*> meshSourceObjects;
 
+    // Where each exported shape landed, by block identity -- the whole point
+    // of the Phase 7 correctif: a NiPSysMeshEmitter references its emission
+    // surface by link, and this carries that identity through to the format
+    // so a consumer never has to guess between eight meshes sharing a name.
+    std::map<Niflib::NiAVObject*, MeshEmitterRef> geometryIndex;
+
     std::set<NiObject*> visited;
     for (const NiObjectRef& b : blocks) {
         NiObject* obj = static_cast<NiObject*>(b);
@@ -491,7 +509,7 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
         if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
             WalkNode(av, Matrix44::IDENTITY, scene, materials, skeletons, visited, result, 0,
-                     verifyStrips, &emitterMeshNames, &meshSourceObjects);
+                     verifyStrips, &emitterMeshNames, &meshSourceObjects, &geometryIndex);
         }
     }
 
@@ -622,7 +640,7 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
                 }
                 if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
                     particleExtractor.Extract(av, skeleton, nodesPtr, materials, scene,
-                                              result.particles);
+                                              result.particles, &geometryIndex);
                 }
             }
         }

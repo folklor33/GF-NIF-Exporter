@@ -21,7 +21,17 @@ namespace gfnif {
 bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::string& error);
 
 /*! Format version written into the .gfmodel. Bumped when the schema changes in
- *  a way a consumer must notice. */
-constexpr int kGfModelFormatVersion = 3;
+ *  a way a consumer must notice.
+ *
+ *  4 (Phase 7 correctif) adds, on each particle system's emitter:
+ *    - "meshEmitterMeshes": the emission-surface references resolved to array
+ *      indices by block identity. "meshEmitterMeshNames" stays, unchanged and
+ *      parallel, but is diagnostic only: a name does not identify a mesh
+ *      (see MeshEmitterRef).
+ *    - "birthRate" / "birthRateKeys": the authored emission density, read off
+ *      the system's NiPSysEmitterCtlr. -1 when the source does not state it.
+ *  Nothing else moves, and no existing field changes meaning, so a version-3
+ *  consumer still reads a version-4 file correctly apart from the new fields. */
+constexpr int kGfModelFormatVersion = 4;
 
 } // namespace gfnif
