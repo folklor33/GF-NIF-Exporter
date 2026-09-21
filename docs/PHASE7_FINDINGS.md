@@ -483,3 +483,165 @@ The last two are listed to prevent someone "fixing" documented, accepted debt.
 4. Camera framing should include particle systems (§8).
 5. The harness currently re-bundles via a manual `esbuild` call; wiring it into an npm
    script would make it harder to run against a stale bundle.
+
+---
+
+# Correctif Phase 7 — couleur, direction, suivi d'animation
+
+Après test navigateur, trois défauts ont été rapportés : les particules ne sont pas
+colorées, leur direction est fausse, et les effets lumineux ne suivent pas leur objet
+animé. Tous les trois sont réels. **Aucune des trois hypothèses du brief n'était exacte
+sur la cause**, ce qui est en soi le résultat le plus utile de ce correctif : chacune a
+été mesurée avant d'être corrigée.
+
+Ordre de travail suivi : le défaut de format d'abord, puisque tout diagnostic portant sur
+des particules émises depuis un mesh arbitraire est sans valeur.
+
+## A. Le correctif de format (§6) — fait
+
+Voir `PHASE5_FINDINGS.md` §3.1 pour le format 4 et sa non-régression. Deux points de
+méthode méritent d'être retenus ici.
+
+**§6.1 s'était trompé d'emplacement.** Il proposait de lire `Birth Rate` sur
+`NiPSysEmitter` « de la même façon `asString()` que les autres scalaires ». Ce champ
+n'existe pas à cette version du NIF : le `asString()` généré de `NiPSysEmitter` s'arrête
+à `Life Span Variation`. Le taux est porté par le `NiPSysEmitterCtlr` du système, et il
+est lisible par de vrais getters typés — aucun parsing de texte. 4768 systèmes sur 6958
+(68,5%) portent désormais un taux authored ; les 2190 autres n'en ont aucun et gardent
+l'estimation `maxParticles / lifeSpan`, signalée comme telle dans le diagnostic.
+
+**§6.2 se corrige exactement.** 4145 références ambiguës par nom, **6111 sur 6111**
+résolues par index de bloc. Le compteur `ambiguousEmitterMeshes` du loader tombe à 0 sur
+un fichier v4 ; une valeur non nulle signale désormais un fichier resté en v3.
+
+## B. Direction — c'était une **double** conversion, pas une conversion manquante
+
+Le brief supposait que three.quarks simulait en espace monde, hors du `root` qui porte la
+rotation Z-up→Y-up, et qu'il fallait donc tourner les grandeurs directionnelles. C'est
+l'inverse : les systèmes sont en `worldSpace: false`, parentés sous leur node d'attache,
+et la rotation leur était déjà appliquée par la hiérarchie. Elle l'était **deux fois**.
+
+Le mécanisme, lu dans `VFXBatch.update` de three.quarks : pour un système en espace
+local, les positions écrites dans le tampon sont déjà en coordonnées **monde**
+(`particle.position.applyMatrix4(system.emitter.matrixWorld)`). Les batches étant des
+enfants du `BatchedRenderer`, et ce renderer étant ajouté à `content` — lui-même sous
+`root` —, la matrice de `root` s'appliquait une seconde fois au rendu. Le
+`root.position.y` qui pose le modèle au sol s'ajoutait de la même manière.
+
+Le correctif tient en deux lignes dans le loader : `matrixWorldAutoUpdate = false` et une
+matrice monde à l'identité sur le renderer. Il reste enfant de `content` pour que la
+visibilité et la libération des ressources suivent le modèle.
+
+C'est précisément le risque de double conversion que le brief signalait comme principal.
+
+## C. Suivi d'animation — l'hypothèse du bind pose était juste, et l'ampleur est mesurée
+
+`MeshSurfaceEmitter` échantillonne le tampon de positions, qui pour un mesh skinné est en
+bind pose : la déformation n'existe que dans le vertex shader. Mesuré sur le corpus :
+
+```
+surfaces d'émission résolues                    : 6 111
+  skinnées                                      : 2 268  (37,1%)
+    liées à un seul os                          : 1 125
+    liées à plusieurs os                        : 1 143
+  dont l'os d'attache du système fait partie
+  des os qui déforment la surface               :    11
+```
+
+Cette dernière ligne est le résultat décisif, et elle écarte le correctif « léger »
+envisagé dans le brief (attacher une surface à influence unique directement à son os) :
+le parentage ne compense presque jamais, parce que le système est attaché à un os **sans
+rapport** avec la surface dont il émet. Le recalcul CPU était donc la seule voie.
+
+`refreshSkinnedEmitterSurface` recalcule les positions déformées à chaque frame via
+`SkinnedMesh.applyBoneTransform`, puis réaffecte la géométrie à `MeshSurfaceEmitter` —
+cette réaffectation n'est pas cosmétique : c'est l'accesseur `geometry` qui reconstruit la
+table cumulative des aires servant à l'échantillonnage pondéré, et sans elle
+l'échantillonnage resterait celui du bind pose malgré des positions à jour. Le coût est
+modeste : ces surfaces font 4 à 250 sommets.
+
+Le loader construit désormais un `SkinnedMesh` invisible pour les surfaces d'émission
+skinnées, seul moyen d'obtenir la déformation. `BuiltParticles.update(delta)` remplace
+`renderer.update(delta)` chez les deux appelants.
+
+## D. Couleur — elle n'est ni dans les clés, ni dans la texture
+
+La Phase 7 avait conclu que le RGB noir des `colorKeys` était un profil d'opacité et que
+la couleur venait de la texture. La première moitié était juste, la seconde fausse : les
+textures d'effets sont en niveaux de gris, et traiter le noir comme du blanc donnait des
+particules blanches. Mesuré sur les 4735 systèmes dont toutes les clés sont noires :
+
+```
+émissive réellement colorée (hors axe des gris) : 3 370  (71,2%)
+diffuse réellement colorée                      : 1 164  (24,6%)
+ni l'une ni l'autre (gris partout)              : 1 353  (28,6%)
+sans NiMaterialProperty du tout                 :     0
+```
+
+La couleur est donc portée par le `NiMaterialProperty` du système, en émissive dans près
+des trois quarts des cas. `materialTint` prend l'émissive, à défaut la diffuse, à défaut
+le blanc — ce dernier redonnant exactement le comportement précédent sur les 1353 systèmes
+réellement gris. Une couleur sur l'axe des gris est traitée comme « pas de teinte » et
+laisse la main à la source suivante : la retenir ne colorerait rien et ne ferait
+qu'assombrir.
+
+L'émissive était **déjà exportée** (`GfxFormatWriter.cpp`, champ `emissive`) : aucun
+changement de format n'était nécessaire pour ce défaut, contrairement à ce que le brief
+envisageait.
+
+## E. Combler l'écart de validation
+
+Le banc vérifiait qu'un système s'affichait, pas qu'il ressemblait au jeu — c'est par là
+que les trois défauts sont passés. `gf.probe()` (dans `driver.ts` du front-end)
+échantillonne l'état **simulé** à plusieurs instants et `tools/gf-harness/checks.mjs` le
+confronte à une attente. Quatre vérifications, chacune **validée en réintroduisant son
+défaut** :
+
+| vérification | ce qu'elle mesure | preuve |
+|---|---|---|
+| `placement` | le centroïde des particules rendues est près de sa surface d'émission | 6 échecs quand la double conversion est remise |
+| `déformation` | une surface skinnée bouge quand ses propres os bougent | 9 échecs quand le recalcul est neutralisé |
+| `couleur` | la teinte rendue correspond à la teinte de la source | 14 échecs avant le correctif D |
+| `suivi` | le centroïde suit le node d'attache quand le clip le déplace | — |
+
+Deux pièges rencontrés en les écrivant, qui valent d'être notés parce qu'ils auraient
+rendu la vérification décorative :
+
+1. **La sonde reproduisait le calcul de three.quarks mais pas la matrice du batch.** Elle
+   n'aurait donc pas vu la double conversion. Il faut multiplier par
+   `renderer.matrixWorld`.
+2. **Comparer les particules à leur émetteur dans le même repère annule le défaut.** La
+   référence correcte est la surface d'émission *telle que le modèle est dessiné*, sans la
+   matrice du renderer — « les particules sont-elles là où est le modèle ».
+
+Une troisième leçon : une vérification trop exigeante est aussi mauvaise qu'une
+vérification absente. Exiger une couleur de tout système signalait 1353 systèmes
+légitimement gris ; exiger un mouvement de toute surface skinnée signalait celles dont
+les os ne bougent pas dans le clip. Les deux sont conditionnées à ce que la source dise.
+
+État : **63 vérifications passées, 0 en échec**, sur 5 modèles.
+
+## F. Modèles à vérifier, et comportement attendu
+
+| modèle | pourquoi | attendu |
+|---|---|---|
+| `chair/C004` | huit meshes `Editable Poly`, 7 systèmes | chaque effet part de sa propre surface ; teintes rouge/orange/violet distinctes par système |
+| `ride/R814` | deux `Editable Poly`, 5 systèmes sur 6 les référencent | `fire_lit` et `PA_j2_fire` suivent l'animation ; plus d'effet flottant à côté du modèle |
+| `monster/M491` | 4 surfaces d'émission skinnées | les effets suivent la déformation, pas seulement la translation de l'os |
+| `chair/C032` | 6 systèmes (fog, star, rose, love) | `PA_love` rose, `PA_star` doré, `PA_rose` crème ; les trois `fog`/`star2` restent blancs, c'est correct |
+| `chair/C001` | émissives colorées, `colorKeys` noires | `PArray01`/`PArray02` magenta, `PArray04` orangé, `PArray03` blanc (émissive [1,1,1]) |
+
+## G. Ce qui reste ouvert
+
+1. `meshEmissionAxis` et `meshInitialVelocityType` ne sont pas consommés : l'émission suit
+   toujours la normale de face (`VELOCITY_USE_NORMALS`), le cas dominant. Les autres types
+   de vitesse ne sont pas traduits.
+2. `gravityObjectNodeIndex` est ignoré : l'axe de gravité est appliqué dans le repère du
+   système, alors que le NIF l'exprime dans celui de l'objet de gravité. À mesurer — la
+   fréquence des cas où les deux diffèrent n'est pas connue.
+3. Le chemin v3 (résolution par nom) ne sait pas quel `SkinnedMesh` déforme une surface :
+   un fichier non réexporté n'a donc pas le suivi du skinning. C'est une raison de plus de
+   réexporter.
+4. La vérification `direction` (alignement de l'accélération du centroïde sur la gravité)
+   est écartée dès qu'il y a turbulence ou trop peu de particules — un centroïde n'est pas
+   un point matériel. `placement` est la vérification décisive sur ce défaut.

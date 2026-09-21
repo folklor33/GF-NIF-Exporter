@@ -199,6 +199,46 @@ curve) is at most a handful of keyframes, nowhere near the size that justifies
 binary storage the way mesh/animation buffers do. Confirmed directly: every
 `.gfbin` byte-for-byte identical before/after this phase (§7).
 
+### 3.1 Format 4 (Phase 7 correctif): two additions to the emitter
+
+Both of these close defects §6 of `PHASE7_FINDINGS.md` reported. Both are
+additive — no existing field moves or changes meaning — and both are on
+`ParticleEmitterData`.
+
+**`meshEmitterMeshes`: the emission surface, by index.** `meshEmitterMeshNames`
+identifies a surface by *name*, and a name does not identify a mesh: 4145 of the
+corpus's 6111 mesh-emitter references (67.8%) name a shape another mesh shares
+its name with, `chair/C004` having eight meshes all called `Editable Poly`. A
+consumer resolving by name emitted from an arbitrary one of them.
+
+The .nif itself is never ambiguous — `NiPSysMeshEmitter` references its surfaces
+by block link — so `MeshExtractor`'s walk now records where each exported shape
+landed (`std::map<NiAVObject*, MeshEmitterRef>`) and `ParticleExtractor`
+resolves those links to `{index, array}`, `array` naming `meshes` or
+`emitterMeshes`. **All 6111 references resolve exactly, none left unresolved**;
+the names stay, parallel and unchanged, as diagnostics.
+
+**`birthRate` / `birthRateKeys`: the authored emission density.** §6.1 named the
+gap correctly but placed it on the wrong block: at this NIF version
+`NiPSysEmitter` has no `Birth Rate` field at all — niflib's generated
+`asString()` prints `Speed` through `Life Span Variation` and nothing else.
+Gamebryo drives the rate from the `NiPSysEmitterCtlr` attached to the
+`NiParticleSystem`, through that controller's `NiFloatInterpolator`, which is
+reachable by real typed getters (no `asString()` parsing needed here, unlike
+every other particle field).
+
+Measured before writing the extraction (`tools/diag/measure_phase7.cpp`): all
+6966 systems carry such a controller; 4768 (68.4%) have an interpolator to read
+— 4686 a constant, 82 a keyed timeline — and 2198 have neither interpolator nor
+data block. Those last keep `birthRate = -1` rather than being given an invented
+value, and a consumer falls back to its own estimate as before. Range on the
+readable ones: 0 to 4500, mean 68.3 particles/second.
+
+**Non-regression.** Full corpus re-exported and compared against the format-3
+baseline: **all 2822 `.gfbin` byte-for-byte identical**, all 2822 `.gfmodel`
+identical line for line outside `formatVersion`, `generator` and the three new
+fields. 1272 files (exactly the particle-bearing count) gained them.
+
 ---
 
 ## 4. The attach-node architecture change
