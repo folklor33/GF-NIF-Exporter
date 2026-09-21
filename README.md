@@ -5,10 +5,15 @@ A Windows CLI tool that converts Grand Fantasia `.nif` models (Gamebryo, NIF
 (`.gfmodel` JSON + `.gfbin` binary buffers) for rendering in Angular/Three.js
 with skeletal animation and particle systems.
 
-> **Status: Phase 2 (static mesh, materials, textures) complete.**
-> The exporter converts a `.nif`'s static bind-pose geometry and materials into
-> `.gfmodel` + `.gfbin`. Skeleton, animations and particle systems arrive in
-> phases 3 to 5; the multi-file scanner and parallel pipeline in phase 6.
+> **Status: Phase 6 (full CLI pipeline) complete.**
+> The exporter converts the whole corpus — geometry, skinning, materials,
+> textures, skeletons, animations (embedded and `.kf`), and particle systems —
+> in parallel, mirroring the input tree on output. Phase 7 (the Angular loader)
+> is a separate project.
+
+**2822 of 2825 `.nif` files convert in ~29 s** on 12 threads (2.07 GB of
+output), byte-identically to the sequential exporter. See
+[docs/PHASE6_FINDINGS.md](docs/PHASE6_FINDINGS.md).
 
 ## Requirements
 
@@ -30,39 +35,80 @@ cmake --build build --config Release
 ```
 
 The `qhull` submodule inside niflib is intentionally **not** required — see
-[docs/PHASE1_FINDINGS.md §4](docs/PHASE1_FINDINGS.md).
+[docs/PHASE1_FINDINGS.md §4](docs/PHASE1_FINDINGS.md). CLI11 is vendored as a
+single header in `external/cli11/`, so there are no package-manager
+dependencies.
 
 ## Usage
 
-### `export` — convert models (phase 2)
+```
+gfnif-export.exe --input <dir> --output <dir> [options]
+
+  -i, --input <path>    Input root holding the entity directories
+                        (monster/, npc/, ride/, effect/, elf/, char/,
+                        chair/, item/), or a single .nif
+  -o, --output <dir>    Output root; the input tree is mirrored here
+      --entities <list> Restrict to some types, comma separated (monster,npc)
+  -t, --threads <n>     Worker threads (default: hardware_concurrency)
+      --debug           Verbose per-file logging, sequential, limited
+      --debug-limit <n> Max files in --debug (default: 10)
+      --noverb          Single repainting progress line, full parallelism
+      --dry-run         Report what would be done, write nothing
+      --overwrite       Re-convert even when the output is newer than the source
+      --log-file <path> Detailed log, written in every mode
+      --report <path>   JSON run report (stats, failures, slowest files)
+      --verify-strips   Cross-check de-striping against niflib (slow)
+```
+
+### Common invocations
 
 ```sh
-# one file
-build\Release\gfnif-export.exe export input\monster\model\M011.nif -o out
+# the whole corpus, quiet, with a log and a machine-readable report
+build\Release\gfnif-export.exe --input input --output out --noverb ^
+    --log-file out\export.log --report out\report.json
 
-# the whole corpus, mirroring the input tree under out\
-build\Release\gfnif-export.exe export input -o out --input-root input
+# one entity type
+build\Release\gfnif-export.exe --input input --output out --entities monster
 
-# list every warning, and cross-check de-striping against niflib
-build\Release\gfnif-export.exe export input -o out --input-root input -v --verify-strips
+# see exactly what happens to the first few files
+build\Release\gfnif-export.exe --input input --output out --debug --debug-limit 5
+
+# what would a re-run do? (writes nothing)
+build\Release\gfnif-export.exe --input input --output out --dry-run
+
+# one model, for diagnosis
+build\Release\gfnif-export.exe --input input\monster\model\M011.nif --output out
 ```
 
 Each `.nif` produces `NAME.gfmodel` (JSON structure) and `NAME.gfbin` (packed
 float32/uint32 buffers). The schema is documented in
-[docs/PHASE2_FINDINGS.md §7](docs/PHASE2_FINDINGS.md).
+[docs/PHASE2_FINDINGS.md §7](docs/PHASE2_FINDINGS.md) and the animation and
+particle additions in the Phase 3–5 findings.
 
-Exit code is `0` when every file converted, `2` if any failed.
+**Exit codes:** `0` all files converted, `2` some files failed (the run still
+completed), `1` the run could not start (bad path, bad option, unwritable
+output).
+
+By default a file is skipped when its `.gfmodel` **and** `.gfbin` both exist
+and are at least as new as the source; `--overwrite` forces re-conversion.
+
+### Output layout
+
+The input tree is reproduced under `--output`:
+
+```
+input/monster/model/M011.nif  ->  out/monster/model/M011.gfmodel
+                                  out/monster/model/M011.gfbin
+```
+
+Animations are picked up automatically from the sibling
+`<type>/animation/NAME.kf`, per
+[docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md).
 
 ### `dump` — inspect block structure (phase 1 diagnostic)
 
 ```sh
-# dump one file
 build\Release\gfnif-export.exe dump input\monster\model\M011.nif
-
-# walk a directory recursively
-build\Release\gfnif-export.exe dump input\monster
-
-# corpus-wide block type tally only
 build\Release\gfnif-export.exe dump input --summary
 ```
 
@@ -72,17 +118,9 @@ Output is a NifSkope-style block list followed by the block tree:
 0 [NiNode] "Scene Root"
 |-- 3 [NiTriShape] "M011"
 |   |-- 6 [NiMaterialProperty] "M011"
-|   |-- 4 [NiTexturingProperty]
-|   |   `-- 5 [NiSourceTexture]
 |   `-- 8 [NiSkinInstance]  -> ptr: 0 11 12 17 ...
-|       |-- 9 [NiSkinData]
-|       `-- 10 [NiSkinPartition]
 `-- 46 [NiNode] "Bip01"
 ```
-
-`-> ptr:` lists non-owning back-references (bone lists, controller targets),
-which are shown but not descended into. Blocks reached more than once are marked
-`(see above)` rather than printed twice.
 
 ### Viewing the result
 
@@ -92,7 +130,6 @@ is a diagnostic, not part of the Angular deliverable. Serve the repo root so the
 
 ```sh
 python -m http.server 8000
-# then open:
 # http://localhost:8000/tools/viewer/?model=/out/monster/model/M011.gfmodel
 ```
 
@@ -100,44 +137,51 @@ python -m http.server 8000
 
 ```
 ├── CMakeLists.txt
-├── vcpkg.json               manifest (no third-party deps yet; hook for later phases)
-├── external/niflib/         submodule -> niftools/niflib (BSD 3-clause)
+├── external/
+│   ├── niflib/              submodule -> niftools/niflib (BSD 3-clause)
+│   └── cli11/CLI11.hpp      vendored CLI11 2.4.2 (BSD 3-clause)
 ├── src/
-│   ├── main.cpp             CLI entry point (dump / export)
-│   ├── export/
-│   │   ├── SceneModel.hpp       niflib-free intermediate representation
-│   │   └── GfxFormatWriter.*    SceneData -> .gfmodel + .gfbin
-│   ├── nif/
-│   │   ├── HeaderNormalizer.*   GF header fix-ups + unsupported-block guard
-│   │   ├── MeshExtractor.*      NiTriShape/NiTriStrips -> MeshData
-│   │   ├── MaterialExtractor.*  NiMaterialProperty/NiTexturingProperty -> MaterialData
-│   │   ├── NifDumper.*          block dump (phase 1 diagnostic)
-│   │   └── QhullStub.cpp        replaces the excluded src/nifqhull.cpp
-│   └── texture/
-│       └── TextureResolver.*    .dds reference -> .png on disk
-├── tools/viewer/            throwaway Three.js validation viewer
-└── docs/
-    ├── PHASE1_FINDINGS.md   block inventory, spec divergences, niflib verdict
-    ├── PHASE2_FINDINGS.md   export results, de-striping, texture resolution
-    └── NAMING_CONVENTIONS.md  input layout, nif/kf pairing, texture resolution
+│   ├── main.cpp             entry point (pipeline / dump)
+│   ├── cli/                 argument parsing, progress reporting
+│   ├── scanner/             .nif discovery and .kf pairing
+│   ├── pipeline/            jobs, thread pool, orchestration, JSON report
+│   ├── util/                logging, path helpers
+│   ├── export/              SceneData -> .gfmodel + .gfbin
+│   ├── nif/                 the extractors (mesh, material, skeleton,
+│   │                        animation, particles) + header fix-ups
+│   └── texture/             .dds reference -> .png on disk
+├── tools/
+│   ├── viewer/              throwaway Three.js validation viewer
+│   └── tsprobe/             niflib thread-safety probe (see Phase 6 §2)
+└── docs/                    PHASE1..6_FINDINGS.md, NAMING_CONVENTIONS.md
 ```
 
 ## Results so far
 
-**Phase 1** — all `.nif`/`.kf` files parse; 56 distinct block types catalogued.
-Two GF-specific header anomalies needed in-memory fix-ups (truncated header
-string, mis-stamped version). See [docs/PHASE1_FINDINGS.md](docs/PHASE1_FINDINGS.md).
+**Phase 1** — all `.nif`/`.kf` parse; 56 block types catalogued; two GF-specific
+header anomalies fixed in memory.
 
-**Phase 2** — **2823 of 2825** `.nif` files convert (6.19M vertices, 7.28M
-triangles, ~11 s), with **98.1%** of texture references resolved. The two skips
-are niflib limitations: one file uses `NiPhysXScene`, which niflib does not
-implement and which crashed the process until a pre-flight block-type check was
-added; another uses unsupported NIF version 20.3.1.0. See
-[docs/PHASE2_FINDINGS.md](docs/PHASE2_FINDINGS.md).
+**Phase 2** — static geometry, materials and textures; the `NiPhysXScene`
+pre-flight guard that stops niflib crashing the process.
+
+**Phase 3** — skeletons and skinning.
+
+**Phase 4** — animations: embedded, external `.kf`, B-splines resampled to
+30 Hz, `XYZ_ROTATION_KEY`.
+
+**Phase 5** — particle systems (`NiParticleSystem`, emitters, modifiers).
+
+**Phase 6** — the parallel pipeline: **6.7× faster (195.6 s → 29.2 s)**,
+byte-identical output, deterministic across runs. niflib was found **not**
+thread-safe as shipped — its lazy block-type registration is a real data race
+(measured: 19 failures and 1 crash in 20 stress runs) — and is made safe by
+forcing registration to completion before any worker starts. See
+[docs/PHASE6_FINDINGS.md](docs/PHASE6_FINDINGS.md).
 
 The niflib submodule remains unmodified throughout.
 
 ## Licence
 
 niflib is included as a submodule under the BSD 3-clause licence
-(`external/niflib/license.txt`).
+(`external/niflib/license.txt`). CLI11 is vendored under the BSD 3-clause
+licence (header preamble in `external/cli11/CLI11.hpp`).

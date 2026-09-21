@@ -76,6 +76,8 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(gfnif-export
     src/main.cpp
+    src/cli/Args.cpp
+    src/cli/ProgressReporter.cpp
     src/export/GfxFormatWriter.cpp
     src/nif/AnimationExtractor.cpp
     src/nif/HeaderNormalizer.cpp
@@ -85,10 +87,24 @@ add_executable(gfnif-export
     src/nif/NifDumper.cpp
     src/nif/ParticleExtractor.cpp
     src/nif/SkeletonExtractor.cpp
+    src/pipeline/ConversionJob.cpp
+    src/pipeline/Orchestrator.cpp
+    src/pipeline/ThreadPool.cpp
+    src/scanner/EntityScanner.cpp
     src/texture/TextureResolver.cpp
+    src/util/Logger.cpp
+    src/util/PathUtils.cpp
 )
-target_include_directories(gfnif-export PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(gfnif-export PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    # CLI11 2.4.2, vendored as the single header it ships as (BSD 3-clause).
+    # SYSTEM so its own warnings do not surface under our /W3 /permissive-.
+)
+target_include_directories(gfnif-export SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/cli11")
 target_link_libraries(gfnif-export PRIVATE niflib_static)
+find_package(Threads REQUIRED)
+target_link_libraries(gfnif-export PRIVATE Threads::Threads)
 
 if(MSVC)
     # Our own code is held to conformance mode, unlike niflib.

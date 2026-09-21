@@ -1,22 +1,28 @@
 // gfnif-export -- CLI entry point.
 //
 // Phase 1 added `dump`: parse a .nif/.kf and print its block structure.
-// Phase 2 adds `export`: convert a .nif's static geometry and materials into
-// a .gfmodel + .gfbin pair.
+// Phase 2 added `export`: convert a .nif's geometry and materials.
+// Phase 6 makes the flag-driven pipeline the primary interface: scan an entity
+// tree, convert in parallel, mirror the tree, and report.
 //
-// The multi-file scanner and parallel pipeline are Phase 6; for now a directory
-// argument is walked serially, which is enough for the 17-file test corpus.
+//   gfnif-export --input <dir> --output <dir> [options]   the pipeline
+//   gfnif-export dump <file|dir> [--summary]              phase 1 diagnostic
+//   gfnif-export export <file|dir> -o <dir> ...           phase 2 diagnostic
+//
+// The two subcommands are kept because every earlier phase was debugged through
+// them, and `--input` pointing at a single file is the supported way to run one
+// model through the real pipeline.
 
-#include "export/GfxFormatWriter.hpp"
-#include "export/SceneModel.hpp"
-#include "nif/MeshExtractor.hpp"
+#include "cli/Args.hpp"
 #include "nif/NifDumper.hpp"
+#include "pipeline/Orchestrator.hpp"
+#include "util/Logger.hpp"
+#include "util/PathUtils.hpp"
 
 #include <algorithm>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -25,33 +31,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void PrintUsage() {
-    std::cout
-        << "gfnif-export\n\n"
-        << "Usage:\n"
-        << "  gfnif-export dump   <file|dir> [--summary]   block structure (phase 1 diagnostic)\n"
-        << "  gfnif-export export <file|dir> -o <outDir>   .nif -> .gfmodel + .gfbin\n"
-        << "\n"
-        << "  export options:\n"
-        << "    -o, --out <dir>   output root (default: ./out)\n"
-        << "    --input-root <d>  strip this prefix when mirroring the input tree\n"
-        << "    -v, --verbose     list every warning instead of counting them\n"
-        << "    --verify-strips   cross-check de-striping against niflib's own expansion\n"
-        << "\n"
-        << "With no command, a bare path is treated as `dump` for compatibility.\n";
-}
-
-bool HasExtension(const fs::path& p, const char* ext) {
-    std::string e = p.extension().string();
-    std::transform(e.begin(), e.end(), e.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return e == ext;
-}
-
-bool IsNifLike(const fs::path& p) { return HasExtension(p, ".nif") || HasExtension(p, ".kf"); }
-
-/*! Collects the files to process under `target`, or just `target` itself. */
-std::vector<fs::path> CollectFiles(const fs::path& target, bool (*accept)(const fs::path&)) {
+std::vector<fs::path> CollectNifLike(const fs::path& target) {
     std::vector<fs::path> files;
     std::error_code ec;
     if (fs::is_directory(target, ec)) {
@@ -60,12 +40,13 @@ std::vector<fs::path> CollectFiles(const fs::path& target, bool (*accept)(const 
             if (ec) {
                 break;
             }
-            if (it->is_regular_file(ec) && accept(it->path())) {
+            if (it->is_regular_file(ec) &&
+                (gfnif::IsNifFile(it->path()) || gfnif::IsKfFile(it->path()))) {
                 files.push_back(it->path());
             }
         }
         std::sort(files.begin(), files.end());
-    } else if (accept(target)) {
+    } else if (gfnif::IsNifFile(target) || gfnif::IsKfFile(target)) {
         files.push_back(target);
     }
     return files;
@@ -73,7 +54,7 @@ std::vector<fs::path> CollectFiles(const fs::path& target, bool (*accept)(const 
 
 int RunDump(const std::vector<std::string>& args) {
     if (args.empty()) {
-        PrintUsage();
+        std::cerr << "usage: gfnif-export dump <file|dir> [--summary]\n";
         return 1;
     }
     const fs::path target = args[0];
@@ -90,7 +71,7 @@ int RunDump(const std::vector<std::string>& args) {
         return 1;
     }
 
-    const std::vector<fs::path> files = CollectFiles(target, IsNifLike);
+    const std::vector<fs::path> files = CollectNifLike(target);
     if (files.empty()) {
         std::cerr << "error: no .nif/.kf files under " << target.string() << "\n";
         return 1;
@@ -129,412 +110,170 @@ int RunDump(const std::vector<std::string>& args) {
     return failures.empty() ? 0 : 2;
 }
 
-int RunExport(const std::vector<std::string>& args) {
-    if (args.empty()) {
-        PrintUsage();
-        return 1;
+void PrintSummary(const gfnif::Options& options, const gfnif::RunSummary& s) {
+    std::ostringstream os;
+    os << "\n==================================================================\n";
+    os << "EXPORT SUMMARY: " << s.converted << "/" << s.totalFiles << " file(s) converted\n";
+    os << "==================================================================\n";
+    if (s.skipped > 0) {
+        os << "Skipped (up to date): " << s.skipped << "\n";
+    }
+    if (s.dryRun > 0) {
+        os << "Would convert       : " << s.dryRun << " (dry run, nothing written)\n";
+    }
+    os << "Failed              : " << s.failed << "\n";
+    os << "Vertices            : " << s.vertices << "\n";
+    os << "Triangles           : " << s.triangles << "\n";
+    os << "Files with skeleton : " << s.filesWithSkeleton << " (" << s.bones << " bones)\n";
+    os << "Files with animation: " << s.filesWithAnimation << " (" << s.clips << " clips)\n";
+    os << "Files with particles: " << s.filesWithParticles << " (" << s.particleSystems
+       << " systems)\n";
+
+    const int texTotal = s.texturesResolved + s.texturesMissing;
+    os << "Textures resolved   : " << s.texturesResolved << "/" << texTotal;
+    if (texTotal > 0) {
+        os << " (" << (100 * s.texturesResolved / texTotal) << "%)";
+    }
+    os << "\n";
+
+    os << "\n--- performance --------------------------------------------------\n";
+    os << "Threads             : " << s.threadsUsed << "\n";
+    os << "Wall time           : " << std::fixed << std::setprecision(2) << s.wallSeconds
+       << " s\n";
+    if (s.wallSeconds > 0.0) {
+        os << "Throughput          : " << std::setprecision(1)
+           << (static_cast<double>(s.totalFiles) / s.wallSeconds) << " file/s";
+        if (s.bytesWritten > 0) {
+            os << ", " << std::setprecision(1)
+               << (static_cast<double>(s.bytesWritten) / (1024.0 * 1024.0) / s.wallSeconds)
+               << " MB/s written";
+        }
+        os << "\n";
+    }
+    if (s.bytesWritten > 0) {
+        os << "Bytes written       : " << std::setprecision(2)
+           << (static_cast<double>(s.bytesWritten) / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
+    }
+    os << std::defaultfloat;
+
+    if (!s.slowest.empty()) {
+        os << "Slowest files       :\n";
+        for (const auto& p : s.slowest) {
+            os << "  " << std::fixed << std::setprecision(2) << p.first << " s  " << p.second
+               << "\n";
+        }
+        os << std::defaultfloat;
     }
 
-    const fs::path target = args[0];
-    fs::path outRoot = "out";
-    fs::path inputRoot;
-    bool verbose = false;
-    bool verifyStrips = false;
+    if (!s.failures.empty()) {
+        os << "\nFAILED FILES (" << s.failures.size() << "):\n";
+        for (const std::string& f : s.failures) {
+            os << "  " << f << "\n";
+        }
+    }
 
-    for (size_t i = 1; i < args.size(); ++i) {
-        const std::string& a = args[i];
-        if ((a == "-o" || a == "--out") && i + 1 < args.size()) {
-            outRoot = args[++i];
-        } else if (a == "--input-root" && i + 1 < args.size()) {
-            inputRoot = args[++i];
-        } else if (a == "-v" || a == "--verbose") {
-            verbose = true;
-        } else if (a == "--verify-strips") {
-            verifyStrips = true;
-        } else {
-            std::cerr << "error: unknown option '" << a << "'\n";
+    std::cout << os.str();
+    (void)options;
+}
+
+int RunPipelineCommand(int argc, char** argv) {
+    gfnif::Options options;
+    std::vector<std::string> warnings;
+    const gfnif::ParseOutcome outcome = gfnif::ParseArgs(argc, argv, options, warnings);
+    if (outcome.shouldExit) {
+        if (!outcome.error.empty()) {
+            std::cerr << "error: " << outcome.error << "\n";
+        }
+        return outcome.exitCode;
+    }
+
+    gfnif::Logger logger;
+    logger.SetConsoleLevel(options.debug ? gfnif::LogLevel::Debug
+                           : options.noverb ? gfnif::LogLevel::Error
+                                            : gfnif::LogLevel::Info);
+
+    if (!options.logFile.empty()) {
+        std::string dirError;
+        if (!gfnif::EnsureParentDirectory(options.logFile, dirError)) {
+            std::cerr << "error: " << dirError << "\n";
+            return 1;
+        }
+        std::string logError;
+        if (!logger.OpenFile(options.logFile, logError)) {
+            std::cerr << "error: " << logError << "\n";
             return 1;
         }
     }
 
-    std::error_code ec;
-    if (!fs::exists(target, ec)) {
-        std::cerr << "error: path not found: " << target.string() << "\n";
-        return 1;
-    }
-    // Mirror the input tree under the output root. Without an explicit
-    // --input-root, a directory target is its own root and a single file lands
-    // flat in the output directory.
-    if (inputRoot.empty() && fs::is_directory(target, ec)) {
-        inputRoot = target;
+    for (const std::string& w : warnings) {
+        logger.Warning("warning: " + w);
     }
 
-    const std::vector<fs::path> files =
-        CollectFiles(target, [](const fs::path& p) { return HasExtension(p, ".nif"); });
-    if (files.empty()) {
-        std::cerr << "error: no .nif files under " << target.string() << "\n";
-        return 1;
+    gfnif::RunSummary summary;
+    const int code = gfnif::RunPipeline(options, logger, summary);
+    if (code == 1) {
+        return code; // setup failure; the pipeline already reported it
     }
 
-    int converted = 0;
-    size_t totalVertices = 0, totalTriangles = 0;
-    int totalDegenerate = 0, totalSkipped = 0, totalWarnings = 0, maxDepth = 0;
-    int texturesResolved = 0, texturesMissing = 0;
-    int totalHelpersDropped = 0, totalHiddenDropped = 0;
-    int filesWithSkeleton = 0, totalBones = 0, maxBones = 0, totalSkinsFailed = 0;
-    int mixedSkinFiles = 0;
-    gfnif::SkinningStats skinning;
-    gfnif::AnimationStats animStats;
-    int filesWithAnimation = 0;
-    gfnif::ParticleStats particleStats;
-    size_t totalParticleSystems = 0;
-    size_t totalAnimationClips = 0, totalAnimationTracks = 0;
-    std::vector<float> clipDurations;
-    std::vector<int> tracksPerClip;
-    std::vector<int> animatedBonesPerClip;
-    std::map<std::string, int> orphanBoneNames;
-    std::vector<std::string> failures;
-    std::vector<std::string> unresolvedTextures;
+    PrintSummary(options, summary);
 
-    for (const fs::path& f : files) {
-        gfnif::SceneData scene;
-        const gfnif::ExtractionResult res = gfnif::ExtractScene(f.string(), scene, verifyStrips);
-
-        std::cout << f.string() << "\n";
-
-        if (!res.success) {
-            std::cout << "  ERROR: " << res.error << "\n";
-            failures.push_back(f.string() + ": " + res.error);
-            continue;
+    if (!options.report.empty()) {
+        std::string reportError;
+        if (!gfnif::WriteJsonReport(options.report, options, summary, reportError)) {
+            std::cerr << "error: " << reportError << "\n";
+            return 1;
         }
-
-        // Mirror the relative path of the input under the output root.
-        fs::path relative = inputRoot.empty() ? f.filename() : fs::relative(f, inputRoot, ec);
-        if (ec || relative.empty()) {
-            relative = f.filename();
-        }
-        const fs::path outBase = (outRoot / relative).replace_extension();
-
-        std::string writeError;
-        if (!gfnif::WriteSceneFiles(scene, outBase.string(), writeError)) {
-            std::cout << "  ERROR: " << writeError << "\n";
-            failures.push_back(f.string() + ": " + writeError);
-            continue;
-        }
-
-        for (const gfnif::MaterialData& m : scene.materials) {
-            if (m.sourceTextureName.empty()) {
-                continue;
-            }
-            if (m.textureFound) {
-                ++texturesResolved;
-            } else {
-                ++texturesMissing;
-                unresolvedTextures.push_back(f.filename().string() + " -> " + m.sourceTextureName);
-            }
-        }
-
-        ++converted;
-        totalVertices += scene.TotalVertices();
-        totalTriangles += scene.TotalTriangles();
-        totalDegenerate += res.degenerateTrianglesDropped;
-        totalSkipped += res.geometriesSkipped;
-        totalHelpersDropped += res.helperGeometriesDropped;
-        totalHiddenDropped += res.hiddenGeometriesDropped;
-        totalWarnings += static_cast<int>(res.warnings.size());
-        maxDepth = std::max(maxDepth, res.maxDepthSeen);
-
-        skinning.Merge(res.skinning);
-        totalSkinsFailed += res.skinsFailed;
-        if (!scene.skeletons.empty()) {
-            ++filesWithSkeleton;
-            for (const gfnif::SkeletonData& s : scene.skeletons) {
-                totalBones += static_cast<int>(s.bones.size());
-                maxBones = std::max(maxBones, static_cast<int>(s.bones.size()));
-            }
-            // Question 3 of the brief: do skinned and unskinned meshes coexist
-            // in one file, and does skeletonIndex = -1 hold up for the latter?
-            const bool anySkinned =
-                std::any_of(scene.meshes.begin(), scene.meshes.end(),
-                            [](const gfnif::MeshData& m) { return m.isSkinned; });
-            const bool anyStatic =
-                std::any_of(scene.meshes.begin(), scene.meshes.end(),
-                            [](const gfnif::MeshData& m) { return !m.isSkinned; });
-            if (anySkinned && anyStatic) {
-                ++mixedSkinFiles;
-            }
-        }
-
-        animStats.Merge(res.animation);
-        if (!scene.animations.empty()) {
-            ++filesWithAnimation;
-            totalAnimationClips += scene.animations.size();
-            for (const gfnif::AnimationClip& clip : scene.animations) {
-                totalAnimationTracks += clip.tracks.size();
-                clipDurations.push_back(clip.durationSeconds);
-                tracksPerClip.push_back(static_cast<int>(clip.tracks.size()));
-                int animatedBones = 0;
-                for (const gfnif::AnimationTrack& t : clip.tracks) {
-                    if (t.boneIndex >= 0) {
-                        ++animatedBones;
-                    } else {
-                        ++orphanBoneNames[t.boneName];
-                    }
-                }
-                animatedBonesPerClip.push_back(animatedBones);
-            }
-        }
-
-        particleStats.Merge(res.particles);
-        totalParticleSystems += scene.particleSystems.size();
-
-        std::cout << "  -> " << outBase.string() << ".gfmodel/.gfbin\n";
-        std::cout << "     " << scene.meshes.size() << " mesh(es), " << scene.materials.size()
-                  << " material(s), " << scene.TotalVertices() << " verts, "
-                  << scene.TotalTriangles() << " tris";
-        if (res.degenerateTrianglesDropped > 0) {
-            std::cout << ", " << res.degenerateTrianglesDropped << " degenerate dropped";
-        }
-        if (!scene.skeletons.empty()) {
-            std::cout << ", " << scene.skeletons[0].bones.size() << " bones/"
-                      << res.skinning.skinnedMeshes << " skinned";
-        }
-        if (!scene.animations.empty()) {
-            std::cout << ", " << scene.animations.size() << " animation clip(s)";
-        }
-        if (!scene.particleSystems.empty()) {
-            std::cout << ", " << scene.particleSystems.size() << " particle system(s)";
-        }
-        std::cout << "\n";
-
-        if (!res.warnings.empty()) {
-            if (verbose) {
-                for (const std::string& w : res.warnings) {
-                    std::cout << "     warning: " << w << "\n";
-                }
-            } else {
-                std::cout << "     " << res.warnings.size()
-                          << " warning(s) (use -v to list)\n";
-            }
-        }
+        std::cout << "\nReport written to " << options.report << "\n";
     }
 
-    std::cout << "\n==================================================================\n";
-    std::cout << "EXPORT SUMMARY: " << converted << "/" << files.size() << " file(s) converted\n";
-    std::cout << "==================================================================\n";
-    std::cout << "Vertices          : " << totalVertices << "\n";
-    std::cout << "Triangles         : " << totalTriangles << "\n";
-    std::cout << "Degenerate dropped: " << totalDegenerate << "\n";
-    std::cout << "Geometries skipped: " << totalSkipped << "\n";
-    std::cout << "Max helpers dropped: " << totalHelpersDropped
-              << " (bone/biped/box gizmos, untextured)\n";
-    std::cout << "Hidden geoms dropped: " << totalHiddenDropped
-              << " (NiAVObject visibility flag)\n";
-    std::cout << "Warnings          : " << totalWarnings << "\n";
-    std::cout << "Max node depth    : " << maxDepth << "\n";
-
-    std::cout << "\n--- skinning ---------------------------------------------------\n";
-    std::cout << "Files with skeleton: " << filesWithSkeleton << "\n";
-    std::cout << "Skeletons           : " << skinning.skeletons << " (" << totalBones
-              << " bones total, max " << maxBones << " in one file)\n";
-    std::cout << "Skinned meshes      : " << skinning.skinnedMeshes << "\n";
-    std::cout << "Skinned vertices    : " << skinning.skinnedVertices << "\n";
-    std::cout << "Mixed skinned/static: " << mixedSkinFiles << " file(s)\n";
-    std::cout << "Skins failed        : " << totalSkinsFailed << " (exported static)\n";
-
-    // The measurement the truncation policy rests on: how many influences the
-    // source actually puts on a vertex, against the 4 the format allows.
-    std::cout << "Max influences/vert : " << skinning.maxInfluencesSeen << "\n";
-    std::cout << "Influence histogram :\n";
-    for (int i = 0; i <= gfnif::SkinningStats::kMaxTrackedInfluences; ++i) {
-        if (skinning.influenceHistogram[i] == 0) {
-            continue;
-        }
-        const double pct = skinning.skinnedVertices > 0
-                               ? 100.0 * static_cast<double>(skinning.influenceHistogram[i]) /
-                                     static_cast<double>(skinning.skinnedVertices)
-                               : 0.0;
-        std::cout << "  " << i << (i == gfnif::SkinningStats::kMaxTrackedInfluences ? "+" : " ")
-                  << " influence(s): " << skinning.influenceHistogram[i] << " ("
-                  << std::fixed << std::setprecision(3) << pct << "%)\n";
-    }
-    std::cout << std::defaultfloat;
-    std::cout << "Vertices truncated  : " << skinning.verticesTruncated;
-    if (skinning.skinnedVertices > 0) {
-        std::cout << " (" << std::fixed << std::setprecision(4)
-                  << (100.0 * static_cast<double>(skinning.verticesTruncated) /
-                      static_cast<double>(skinning.skinnedVertices))
-                  << "%)" << std::defaultfloat;
-    }
-    std::cout << "\n";
-    std::cout << "Weight discarded    : total " << skinning.weightDiscarded << ", max single "
-              << skinning.maxWeightDiscarded << "\n";
-    std::cout << "Unweighted & drawn  : " << skinning.unweightedVerticesInUse
-              << " vertex/vertices\n";
-
-    std::cout << "Skinned from partit.: " << skinning.skinsFromPartition
-              << " mesh(es) (NiSkinData had no weights)\n";
-    std::cout << "InvBind conflicts   : " << skinning.boneSkinMatrixConflicts << " (max delta "
-              << skinning.maxSkinMatrixConflict << ")\n";
-    std::cout << "NiSkinPartition     : " << skinning.partitionsChecked << " checked, "
-              << skinning.partitionsMissing << " absent\n";
-    std::cout << "  influences compared : " << skinning.partitionVerticesCompared << "\n";
-    std::cout << "  bone missing in data: " << skinning.partitionBoneMissing << "\n";
-    std::cout << "    ...on a vertex NiSkinData never weights: "
-              << skinning.partitionBoneMissingOnUnweighted << "\n";
-    // The number that must stay 0: an influence on a vertex NiSkinData DOES
-    // weight, where the partition names a bone we did not read. That would be
-    // a mis-read of the bone mapping. Anything on an entirely unweighted vertex
-    // is a corpus gap instead, handled by the root-pin fallback.
-    std::cout << "    ...contradicting a weighted vertex: "
-              << (skinning.partitionBoneMissing - skinning.partitionBoneMissingOnUnweighted)
-              << "   <-- must be 0\n";
-    std::cout << "  bone truncated away : " << skinning.partitionBoneTruncatedAway
-              << " (expected, we cap at " << gfnif::kInfluencesPerVertex << ")\n";
-    std::cout << "  weight differs      : " << skinning.partitionWeightMismatches
-              << " (expected: partition caps+renormalises)\n";
-    std::cout << "  partition < ours    : " << skinning.partitionWeightBelowOurs
-              << " (max shortfall " << skinning.maxPartitionBelowDelta << ")\n";
-    std::cout << "  max weight delta    : " << skinning.maxPartitionWeightDelta << "\n";
-
-    std::cout << "\n--- animation ---------------------------------------------------\n";
-    std::cout << "Files with animation: " << filesWithAnimation << "\n";
-    std::cout << "Animation clips     : " << totalAnimationClips << " (" << animStats.embeddedClips
-              << " embedded, " << animStats.kfClips << " from " << animStats.kfFilesFound
-              << " .kf file(s))\n";
-    std::cout << "Tracks              : " << totalAnimationTracks << " (" << animStats.classicTracks
-              << " classic keyframe, " << animStats.bSplineTracks << " B-spline resampled)\n";
-    std::cout << "ControllerLink rows : " << animStats.tracksTotal << " total, "
-              << animStats.tracksSkippedOutOfScope
-              << " out of scope (material/UV/visibility, not a bone transform), "
-              << animStats.tracksStaticPoseOnly
-              << " static pose only (no timeline for this clip), "
-              << animStats.tracksBSplineEmpty
-              << " B-spline with no channel data, "
-              << animStats.tracksFailed << " genuinely failed to extract\n";
-    std::cout << "Euler rotation      : " << animStats.tracksWithUnsupportedEulerRotation
-              << " classic track(s) used XYZ_ROTATION_KEY (composed into quaternion keys)\n";
-    // Denominator is extracted bone tracks (classic + B-spline), not every
-    // ControllerLink row: out-of-scope rows (material/UV/visibility) were
-    // never bone tracks in the first place and have no bone to resolve.
-    const int extractedTracks = animStats.tracksResolved + animStats.tracksOrphaned;
-    std::cout << "Track resolution    : " << animStats.tracksResolved << "/" << extractedTracks;
-    if (extractedTracks > 0) {
-        std::cout << " (" << std::fixed << std::setprecision(2)
-                  << (100.0 * animStats.tracksResolved / extractedTracks) << "%)"
-                  << std::defaultfloat;
-    }
-    std::cout << " resolved to a skeleton bone, " << animStats.tracksOrphaned << " orphaned\n";
-    std::cout << "Scale animated      : " << animStats.tracksWithScaleAnimated << "/"
-              << extractedTracks << " track(s)\n";
-    std::cout << "Total keyframes     : " << animStats.totalKeyframesWritten << "\n";
-
-    if (!clipDurations.empty()) {
-        std::vector<float> sortedDur = clipDurations;
-        std::sort(sortedDur.begin(), sortedDur.end());
-        const auto pct = [&](double p) {
-            size_t idx = static_cast<size_t>(p * (sortedDur.size() - 1));
-            return sortedDur[idx];
-        };
-        double sumDur = 0.0;
-        for (float d : sortedDur) sumDur += d;
-        std::cout << "Clip duration (s)   : min " << sortedDur.front() << ", p50 " << pct(0.5)
-                  << ", p90 " << pct(0.9) << ", max " << sortedDur.back() << ", mean "
-                  << (sumDur / sortedDur.size()) << "\n";
-
-        std::vector<int> sortedTracks = tracksPerClip;
-        std::sort(sortedTracks.begin(), sortedTracks.end());
-        std::cout << "Tracks/clip         : min " << sortedTracks.front() << ", p50 "
-                  << sortedTracks[sortedTracks.size() / 2] << ", max " << sortedTracks.back()
-                  << "\n";
-
-        std::vector<int> sortedBones = animatedBonesPerClip;
-        std::sort(sortedBones.begin(), sortedBones.end());
-        std::cout << "Animated bones/clip : min " << sortedBones.front() << ", p50 "
-                  << sortedBones[sortedBones.size() / 2] << ", max " << sortedBones.back() << "\n";
-    }
-
-    std::cout << "\n--- particles ----------------------------------------------------\n";
-    std::cout << "Files with particles: " << particleStats.filesWithParticles << "\n";
-    std::cout << "Particle systems    : " << totalParticleSystems << "\n";
-    std::cout << "Attach node resolved: " << particleStats.systemsAttachNodeResolved << "/"
-              << particleStats.systemsTotal << "\n";
-    std::cout << "Material resolved   : " << particleStats.systemsMaterialResolved << "/"
-              << particleStats.systemsTotal << " (" << particleStats.systemsTextureFound
-              << " with texture found)\n";
-    std::cout << "Emitters            : " << particleStats.emittersBox << " Box, "
-              << particleStats.emittersMesh << " Mesh, " << particleStats.emittersUnsupported
-              << " unsupported\n";
-    std::cout << "Emitter object resolved: " << particleStats.emitterObjectResolved << "/"
-              << (particleStats.emittersBox + particleStats.emittersMesh) << "\n";
-    std::cout << "Modifiers           : " << particleStats.modifiersGravity << " Gravity ("
-              << particleStats.gravityObjectResolved << " with object resolved), "
-              << particleStats.modifiersRotation << " Rotation, " << particleStats.modifiersGrowFade
-              << " GrowFade, " << particleStats.modifiersColor << " Color ("
-              << particleStats.modifiersColorKeysMissing << " missing data), "
-              << particleStats.modifiersUnsupported << " unrecognised\n";
-    std::cout << "Mesh emitter surfaces: " << particleStats.meshEmitterNameRefsHiddenKept << "/"
-              << particleStats.meshEmitterNameRefs << " resolved ("
-              << particleStats.meshEmitterNameRefsUnresolved << " unresolved)\n";
-
-    if (!orphanBoneNames.empty()) {
-        std::vector<std::pair<std::string, int>> orphans(orphanBoneNames.begin(),
-                                                          orphanBoneNames.end());
-        std::sort(orphans.begin(), orphans.end(),
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
-        std::cout << "Most frequent orphaned track names (" << orphans.size()
-                  << " distinct):\n";
-        for (size_t i = 0; i < orphans.size() && i < 15; ++i) {
-            std::cout << "  " << orphans[i].second << "x  \"" << orphans[i].first << "\"\n";
-        }
-    }
-
-    const int texTotal = texturesResolved + texturesMissing;
-    std::cout << "Textures resolved : " << texturesResolved << "/" << texTotal;
-    if (texTotal > 0) {
-        std::cout << " (" << (100 * texturesResolved / texTotal) << "%)";
-    }
-    std::cout << "\n";
-
-    if (!unresolvedTextures.empty()) {
-        std::cout << "\nUNRESOLVED TEXTURES (" << unresolvedTextures.size() << "):\n";
-        for (const std::string& t : unresolvedTextures) {
-            std::cout << "  " << t << "\n";
-        }
-    }
-    if (!failures.empty()) {
-        std::cout << "\nFAILED FILES (" << failures.size() << "):\n";
-        for (const std::string& f : failures) {
-            std::cout << "  " << f << "\n";
-        }
-    }
-
-    return failures.empty() ? 0 : 2;
+    logger.Flush();
+    return code;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        PrintUsage();
+        std::cerr << "gfnif-export: missing arguments (try --help)\n";
         return 1;
     }
 
-    const std::string command = argv[1];
-    std::vector<std::string> rest(argv + 2, argv + argc);
-
-    if (command == "dump") {
-        return RunDump(rest);
-    }
-    if (command == "export") {
-        return RunExport(rest);
-    }
-    if (command == "-h" || command == "--help") {
-        PrintUsage();
-        return 0;
+    const std::string first = argv[1];
+    if (first == "dump") {
+        return RunDump(std::vector<std::string>(argv + 2, argv + argc));
     }
 
-    // Compatibility with the Phase 1 invocation: a bare path means dump.
-    std::vector<std::string> legacy(argv + 1, argv + argc);
-    return RunDump(legacy);
+    // `export <path> ...` was the Phase 2 spelling and is documented in the
+    // findings of phases 2 to 5. Rewrite it onto the pipeline so those
+    // invocations keep working: the bare positional becomes --input, and
+    // --input-root is dropped (the pipeline derives it from --input).
+    if (first == "export") {
+        std::vector<std::string> owned;
+        owned.push_back(argv[0]);
+        bool tookInput = false;
+        for (int i = 2; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--input-root" && i + 1 < argc) {
+                ++i; // the pipeline mirrors from --input; this is now implicit
+                continue;
+            }
+            // The Phase 2 form always led with the path, before any option.
+            if (!tookInput && !a.empty() && a[0] != '-') {
+                owned.push_back("--input=" + a);
+                tookInput = true;
+                continue;
+            }
+            owned.push_back(a);
+        }
+        std::vector<char*> forwarded;
+        forwarded.reserve(owned.size());
+        for (std::string& s : owned) {
+            forwarded.push_back(s.data());
+        }
+        return RunPipelineCommand(static_cast<int>(forwarded.size()), forwarded.data());
+    }
+
+    // Everything else is the Phase 6 pipeline, including --help and --version,
+    // which CLI11 handles.
+    return RunPipelineCommand(argc, argv);
 }
