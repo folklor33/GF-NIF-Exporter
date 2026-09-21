@@ -539,3 +539,220 @@ confirming that would mean this correctif regressed something.
 Measurement tool: `tools/diag/measure_emitter_meshes.cpp` (not wired into
 CMake, built ad hoc, same `cl.exe` invocation as §2's tools — see
 PHASE4_FINDINGS §13.7).
+
+---
+
+## 13. Correctif — viewer can now visualise `emitterMeshes`, closing the "wait for Phase 7" gap
+
+**Why:** §12's fix routed hidden emission-surface geometry into
+`SceneData::emitterMeshes`, but nothing in the viewer could show it — the
+particle markers (§7) render bone origins, which were already correct
+before §12's fix and stay identical regardless of whether it worked. There
+was no way to see, before Phase 7's real particle engine exists, whether an
+emitter mesh actually sits where the game shows an effect (eyes, harness,
+paws) rather than off in space. §12 itself flagged this as exactly the kind
+of deferred verification that cost real time in Phase 4.
+
+**Added to `tools/viewer/index.html`:** a dedicated "emitter meshes" toggle
+(off by default, so it never gets in the way of ordinary model
+inspection), separate from the existing "particle markers" toggle.
+Enabling it renders every `model.emitterMeshes[]` entry as a
+**wireframe, semi-transparent, distinctly-tinted** (`0x33d0ff`, cyan)
+`MeshBasicMaterial`, plus a name label, using `CSS2DObject` the same way
+particle-marker labels already work.
+
+**Implementation reuses the real mesh-building path, not a separate one.**
+The per-mesh construction inside `buildScene()` (geometry attributes,
+skin binding, node/skeleton parenting) was factored into `buildOneMesh(m,
+materialFor)`, called once per `model.meshes` entry (unchanged behaviour,
+`materialFor = null` keeps the existing NiAlphaProperty-derived
+`MeshStandardMaterial`) and once per `model.emitterMeshes` entry when the
+toggle is on (`materialFor` swapped for the tinted wireframe look). Because
+`MeshData` is the exact same struct/JSON shape for `meshes` and
+`emitterMeshes` (SceneModel.hpp, confirmed identical accessor layout in
+GfxFormatWriter.cpp's shared `writeMeshJson`), an emitter mesh gets
+**identical parenting/skinning/nodeIndex handling as a real rendered
+mesh** — same skeleton bone if skinned, same animated scene-node
+reattachment if not — with no new transform code. This is deliberate: it
+makes the toggle a genuine end-to-end check (does the emission surface
+sit where the game shows the effect, and does it follow the bone the way
+real geometry does), not a separate code path that could silently disagree
+with how the exporter actually parents this geometry.
+
+**What to verify visually (per the correctif brief):** re-exporting
+`ride/R814.nif` and `chair/model/C038.nif` with the current build shows
+both now have **0** `emitterMeshes` entries — their resolved mesh-emitter
+surfaces (`Editable Poly`, `Editable Poly@#2` on R814; 6 on C038) turned
+out to already be visible geometry, so they resolved into the ordinary
+`meshes` array and never needed the hidden-shape exception. Neither file is
+a working example for this specific toggle, despite being the named
+validation targets in the correctif brief.
+
+**`monster/model/M491.nif` (this section's own §8-§11 reference file) is a
+confirmed working example**, re-exported this session:
+`emitterMeshes` has 4 entries, all named `Editable Poly`, all
+`isSkinned: true` — exercising the skinned/bone-parented path specifically,
+not just the simpler unskinned-node case. Load `M491.gfmodel`, enable
+"emitter meshes", and confirm the cyan wireframe surfaces appear on the
+model (not detached in space) and, since this file also has a companion
+animation, that they move with their bone during clip playback exactly
+like the particle markers already do. A `ride/` mount with a non-empty
+`emitterMeshes` list would additionally validate the eyes/harness/paws
+framing from the original brief, but was not found among the files
+re-exported this session — worth checking a wider sample in a future
+session if that specific visual claim needs confirming.
+
+---
+
+## 14. Phase 5 closure
+
+**Written for a reader with none of this phase's conversation history** —
+everything needed to pick up from here should be in this section or the
+ones it points to; check `git log` for what has actually landed (briefs
+and even prior findings sections describe intent at the time, this section
+describes the state Phase 5 was closed in).
+
+**Status: Phase 5 is done.** The particle-system data exported into
+`.gfmodel` is measured, corpus-validated, and correct — that is the bar
+that closes this phase: what is *exported* must be right, verified
+independently of any one consumer's rendering choices (the same standard
+this project applied when it walked back `ReconstructBindPoseFromSkin` in
+Phase 4 — see PHASE4_FINDINGS §14.2 — after realising a harness that
+embeds a rendering/consumer opinion cannot settle an export-correctness
+question). Two items remain genuinely open (§14.4 below) but both belong
+to Phase 7 (the Angular/Three.js loader), not to this phase's own scope.
+
+### 14.1 What this phase does and does not do
+
+**Extracts and serialises particle-system *parameters* into `.gfmodel`.
+Renders nothing.** No particle is simulated or drawn anywhere in this
+project's own code. `tools/viewer/index.html`'s "particle markers" (§7)
+and "emitter meshes" (§13) toggles are diagnostic-only: a marker sphere at
+an attach point, and a wireframe of an emission surface, neither of which
+is what a particle effect actually looks like. The real rendering — an
+actual particle simulation driven by these exported parameters, using a
+JS particle library such as three.quarks — is Phase 7's job, in the
+Angular consumer app, not this exporter.
+
+### 14.2 Emitter/modifier coverage: what is handled, what is not, and why
+
+**Emitter types:** only `NiPSysBoxEmitter` and `NiPSysMeshEmitter` are
+extracted — because those are the *only two emitter types that occur
+anywhere in the corpus* (measured exhaustively, §2). `NiPSysSphereEmitter`/
+`NiPSysCylinderEmitter` are real niflib classes but occur zero times; an
+emitter type outside this set is skipped with a warning
+(`ParticleStats::emittersUnsupported`), never guessed at. 0 occurrences of
+that warning on the full corpus (§5).
+
+**Modifiers:** `NiPSysGravityModifier`, `NiPSysRotationModifier`,
+`NiPSysGrowFadeModifier`, `NiPSysColorModifier` are extracted with full
+per-effect fields, because these are the modifiers that actually vary
+between effects (§2). `NiPSysAgeDeathModifier`/`BoundUpdateModifier`/
+`PositionModifier`/`SpawnModifier` are kept as type-only entries (no
+per-effect fields extracted) because they are attached to **every single
+system** in the corpus with template-default values — engine bookkeeping,
+not authored variation (§2). `NiPSysColliderManager` (17 occurrences) and
+`NiPSysMeshUpdateModifier` (1 occurrence) are kept as type-only entries
+with a warning on each occurrence, genuinely not implemented because they
+are too rare to justify it (§2) — a future corpus update making either
+common would show up immediately as a rise in
+`ParticleStats::modifiersUnsupported` (18 total today), not silently
+mis-extract.
+
+**Values are kept in the NIF's own units/enums throughout** (radians, raw
+`ForceType`/`VelocityType`/`EmitFrom`/blend-mode integers) — the same
+"export stays faithful to the source, the consumer's loader translates"
+principle already applied to Z-up axes (Phase 2) and `NiAlphaProperty`
+blend state (Phase 2 §10). Phase 7's loader is responsible for translating
+every one of these into whatever a specific particle library expects.
+
+### 14.3 The `emitterMeshes` correctif: what it is and why the visibility filter must NOT be reopened generally
+
+A `NiPSysMeshEmitter` emits from the surface of a named mesh
+(`meshEmitterMeshNames`). Those meshes are almost always marked
+not-visible in the source file (§12) — they are an emission volume, not
+something meant to render. Phase 3 added an unconditional filter that
+drops every hidden shape (`GetVisibility() == false`), originally to fix
+`M491`'s opaque-panel defect (a hidden decorative gizmo leaking into the
+render path). That filter, applied unconditionally, was also dropping the
+33.4% of `meshEmitterMeshNames` references that happen to point at a
+hidden shape — so a particle system referencing that name resolved to
+nothing.
+
+**The fix is a narrow, structural exception, not a reopening of the
+filter:** `ParticleExtractor::CollectMeshEmitterNames` scans every
+`NiPSysMeshEmitter` up front for the set of geometry names any emitter
+actually references. Only a hidden shape whose name is in *that specific
+set* is kept — routed to the new `SceneData::emitterMeshes` array, never
+back into `SceneData::meshes`. Every other hidden shape is dropped exactly
+as before Phase 3 intended. **Do not loosen the general hidden-geometry
+filter itself** — that would reintroduce the exact M491 defect this
+project already spent real effort fixing (PHASE3_FINDINGS §12).
+`emitterMeshes` is a deliberately separate array specifically so no
+existing render path can show this geometry by accident (§12) —
+consuming it means looking a name up in `emitterMeshes` specifically, only
+when resolving a `meshEmitterMeshNames` entry, never rendering the array
+wholesale.
+
+### 14.4 Open items for Phase 7
+
+**1. The fur/alpha-test rendering question (see
+[docs/PHASE2_FINDINGS.md §11](PHASE2_FINDINGS.md) for the full
+diagnosis).** An alpha-test-only material (no blending) cannot reproduce a
+soft cutout edge with Three.js's binary `alphaTest` — confirmed on
+`ride/R814`'s fur and, on inspection, on `monster/model/M491` too (same
+exact alpha-test signature, smaller/less visible region). **This affects
+2197 of 2829 files (77.7% of the corpus)** — a structural rendering
+decision for Phase 7, not a one-file cosmetic issue. Three directions to
+evaluate, none tried yet: rendering these materials as blended instead of
+using `alphaTest` literally (most consistent with this project's own
+translation-in-the-loader principle), `alphaToCoverage`, or a custom
+shader if neither suffices. The exported alpha data itself
+(`alphaBlendEnabled`/`alphaTestEnabled`/`alphaTestFunc`/
+`alphaTestThreshold`) needs no change — this is purely a render-technique
+choice.
+
+**2. `colorKeys` black RGB in 90.6% of cases (16 757/18 497 keys,
+§12).** Not a bug — an opacity-only color profile (black RGB, real alpha)
+is common, measured as authored variation rather than universal, so left
+as-is per this phase's "no interpretation" principle. **Worth an eye in
+Phase 7 specifically**: a black `colorKeys` entry rendered under additive
+blending (the most common particle blend mode in this corpus, §2 of
+PHASE2_FINDINGS) would be invisible — check whether the intended blend
+mode is additive before assuming a black-RGB particle should render
+anything visible at all; this may be intentional (an opacity-only fade
+effect) rather than a defect.
+
+**3. Texture resolution is not universal: 99.4% (6915/6958 systems).**
+The 43 unresolved match the pre-existing corpus-wide unresolved-texture
+list (missing `.dds`→`.png` on disk, not particle-specific) — same
+`textureFound: false` fallback behavior as any other material. No action
+needed beyond what the exporter already does; noted so Phase 7 does not
+treat a small number of texture-less particle systems as a new bug.
+
+**4. `emitterObjectNodeIndex` and `attachNodeIndex` are genuinely
+different fields 28.1% of the time (§12)** — the brief's original
+suspicion that one might be redundant does not hold on the full corpus.
+**Both fields are required**: `attachNodeIndex` is where the particle
+*system* sits in the scene graph (parent it here to follow an animated
+bone, §5), `emitterObjectNodeIndex` is the node the emitter's own shape
+(box dimensions, or the mesh-emitter's `emitterMeshes` surface) is
+expressed relative to — routinely a sibling `<name>-Emitter` node, not the
+system's own parent. A consumer that only reads one of these will
+misplace either the particle system itself or its emission shape on more
+than a quarter of the corpus's systems.
+
+### 14.5 Where to look
+
+- Corpus measurements and the `asString()`-parsing approach: §1–§2.
+- Format (`ParticleSystemData`/`ParticleEmitterData`/`ParticleModifierData`):
+  §3, and `SceneModel.hpp` directly.
+- The attach-node/node-hierarchy architecture change: §4.
+- Extraction results and validation: §5–§6, §10.
+- Viewer diagnostics (particle markers, emitter meshes): §7, §13.
+- The `emitterMeshes` correctif in full: §12.
+- The open fur/alpha-test question: [PHASE2_FINDINGS.md §11](PHASE2_FINDINGS.md).
+
+**No headless browser available in this environment** (same recurring
+limitation, PHASE4_FINDINGS §11/§14, PHASE5_FINDINGS §7) — this addition
+is unverified from this side; the check above is what to run manually.

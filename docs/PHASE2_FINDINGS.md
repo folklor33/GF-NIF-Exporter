@@ -523,3 +523,147 @@ geometry nor skinning moved. `NiTexturingProperty` alpha maps / multi-texture
 blending (a texture's *own* alpha channel driving a separate blend mode, as
 opposed to the material-level `NiAlphaProperty` this fix covers) was not
 investigated and is out of scope here, same as the brief's boundary.
+
+---
+
+## 11. Correctif — residual fur halo on `ride/R814`, diagnosed as an export-correct but open rendering question for Phase 7
+
+**Reported symptom:** on `ride/R814` (a mount with fur), a faint opaque halo
+appears around fur silhouettes — different from the M491 "large opaque
+panel" defect this section originally fixed: not a whole surface wrongly
+opaque, but a thin fringe of wrongly-opaque pixels at the edge of an
+otherwise-transparent cutout region.
+
+**Cause, confirmed by dumping R814's own exported material data (no new
+diagnostic tool needed — the existing `.gfmodel` export already has every
+field to check):** R814's fur/body material (`materialIndex 0`, texture
+`R81401.png`) is **alpha-test-only, not blended** —
+`alphaBlendEnabled: false, alphaTestEnabled: true, alphaTestFunc: 4
+(GREATER), alphaTestThreshold: 125`. Per this section's own viewer design
+(§"Viewer" above), that combination is correctly treated as a hard cutout:
+`transparent` stays unset, `depthWrite: true`, `alphaTest: 125/255 ≈ 0.49`.
+A hard cutout is binary by construction — a texel at alpha 124 vanishes
+entirely, one at 126 renders **fully opaque** — so any texture with a
+*progressive* alpha gradient at its cutout edge (exactly what a fur/hair
+silhouette needs to look soft) will show a thin ring of fully-opaque pixels
+right at the threshold, which is the reported halo.
+
+**Measured, not assumed — `R81401.png`'s own alpha channel (1024×1024,
+Pillow):** 256 distinct alpha values present (a genuine progressive
+gradient, ruling out a flattened/quantized PNG — see point 4 of the
+diagnostic brief), 95.1% fully opaque, 4.1% fully transparent, and 1826
+pixels (0.17%) sitting in the 100–150 band that straddles the 125
+threshold — this is the fringe that becomes the halo.
+
+**Non-isolated: the exact same alpha state exists on the reference file,
+M491, and is not a difference between the two files.** M491's own body
+material (`materialIndex 0`, texture `M49101.png`) has **identically**
+`alphaBlendEnabled: false, alphaTestEnabled: true, alphaTestFunc: 4,
+alphaTestThreshold: 125` — the same signature, same viewer code path. Its
+texture's own alpha histogram (same method) shows an even larger soft-edge
+population (3405 pixels in the 100–150 band) and a bigger transparent
+region (20.6% vs R814's 4.1%). M491 was the Phase 2 validation case for the
+*blend* fix (§8) — a different material on that file — and was never
+checked for this alpha-test artifact specifically, so "M491 doesn't show it"
+was an assumption, not a prior measurement; the data says the artifact's
+raw ingredients (binary threshold across a soft gradient) are present on
+M491 too, just on a smaller/less visually salient region (a small cutout
+detail rather than the large fur silhouette R814's whole body has).
+
+**Corpus-wide prevalence, full corpus (2829 exported `.gfmodel` files,
+scanned directly — no re-export needed):**
+
+```
+Files with >=1 alpha-test-only material (blend off, test on): 2197 / 2829  (77.7%)
+Alpha-test-only materials total                              : 2243 / 15217
+  of which func=GREATER(4), threshold=125 (R814/M491's exact signature): 2144
+Materials with BOTH blend and test enabled                    : 149
+  (handled correctly per §"Viewer": transparent=true, depthWrite=false,
+   alphaTest set -- the blend branch runs first and test's `if (!blend)`
+   guard correctly does not re-enable depthWrite)
+```
+
+**This is not an R814-specific defect and not rare: over three-quarters of
+the corpus's files carry at least one alpha-test-only material, and the
+overwhelming majority share the exact threshold/func R814 and M491 use** —
+almost certainly a single shared authoring convention across GF's
+Gamebryo-era pipeline (confirms `alphaTestFunc`/`threshold` decoding again
+from a second, independent file, on top of §2's original 12-tuple survey).
+
+**Where the boundary from the diagnostic brief lands, per point by point:**
+
+1. **Alpha state correctly extracted** — confirmed identical on R814 and
+   M491, both dumped directly from the export with no ambiguity.
+2. **Viewer applies the extracted values faithfully**, including the
+   blend+test-together case (149 materials, handled correctly, see above) —
+   no bug found in `buildStandardMaterial`'s branching.
+3. **Threshold conversion (`/255`) and comparison direction are correct**:
+   Three.js's `alphaTest` keeps a pixel when `alpha > threshold` (GREATER),
+   which is exactly `NiAlphaProperty::TestFunc` 4 (`GREATER`) — the only
+   `alphaTestFunc` value observed anywhere in the corpus when testing is
+   enabled at all (§2), so there is no NIF test-function this exporter
+   would render backwards.
+4. **PNG alpha channel is a genuine progressive gradient** (256 distinct
+   values), not a flattened/quantized one — the DDS→PNG conversion is not
+   the cause.
+5. **Root cause is `alphaTest`'s binary nature itself** (point 5 of the
+   brief): a hard threshold cannot reproduce a soft edge from a continuous
+   alpha gradient. This is a real constraint of that *specific* rendering
+   technique — but it is not the only technique available, and the
+   original game renders this same fur without a halo, so a correct
+   render is possible. **Not a closed limitation — see below.**
+
+**Decision: export is correct and unchanged — this is an OPEN QUESTION for
+Phase 7, not a closed "nothing to do".** The exported alpha data is
+faithful to the NIF (`alphaBlendEnabled`/`alphaTestEnabled`/`alphaTestFunc`/
+`alphaTestThreshold`, all confirmed correct above) and needs no change —
+that much *is* settled, per this project's export/viewer boundary
+(§"Perimetre" of the brief). What is **not** settled is how a consumer
+should render an alpha-test-only material to avoid this halo. `alphaTest`
+alone cannot do it, but nothing requires a consumer to translate NIF
+"alpha test" into Three.js `alphaTest` specifically — the project's own
+standing principle (§6, §9, and this section's own "Viewer" paragraph) is
+that the export stays faithful to the source and the *translation* to a
+render technique is the loader's job, which leaves room to choose a
+different technique for this case. Three directions, **none evaluated in
+this session**, that Phase 7 should assess before assuming the halo is
+unavoidable:
+
+1. **Render alpha-test-only materials as blended instead of using
+   `alphaTest`.** The NIF says "alpha test", but the consumer is not
+   obligated to reproduce that mechanism literally — a blended render of
+   the same texture would reproduce the soft gradient this data already
+   has (confirmed: 256 distinct alpha values, not a flattened mask). This
+   is the most direct fix and the most consistent with the project's own
+   translation-happens-in-the-loader principle.
+2. **`alphaToCoverage`** (mentioned in the original diagnostic brief,
+   not evaluated in this session) — an MSAA-based technique that dithers
+   the cutout across sample points instead of a hard per-pixel threshold,
+   which could soften the edge while keeping the depth/sort behavior of a
+   true cutout (relevant for fur, which self-overlaps — see this
+   section's existing "Known limitation" note on transparent sort order).
+3. **A custom shader**, if neither of the above proves sufficient — the
+   fallback if a soft edge needs behavior neither of the built-in Three.js
+   techniques provides.
+
+**This is a structural question, not an edge case: 2197 files (77.7% of
+the 2829-file corpus) carry at least one alpha-test-only material**, and
+2144 of those share R814/M491's exact threshold/func signature (§ above).
+Whatever Phase 7 decides here will visibly affect more than three
+quarters of the corpus, not just R814's fur — this is the reason to treat
+it as a real open question rather than a one-off cosmetic note.
+
+**Why this was not resolved in Phase 5 itself:** `tools/viewer/index.html`
+is explicitly a throwaway validation tool (its own file header says so),
+built across Phases 2–4 to eyeball exported data, not the real rendering
+path. The real consumer is the Angular/Three.js loader Phase 7 builds, so
+picking and implementing a rendering technique for this case belongs
+there, not as a patch to the diagnostic viewer.
+
+**Non-regression:** no code changed in this correctif (measurement/dumping
+only, using the existing export + Pillow), so M491 and every other
+previously-validated file are unaffected by construction. Re-confirmed the
+blend-only fix from §8-§10 above is untouched: M491's blend-enabled
+materials (indices 1–7) all still show `alphaBlendEnabled: true`,
+`alphaTestEnabled: false` in this session's dump, matching the original
+fix's intent.

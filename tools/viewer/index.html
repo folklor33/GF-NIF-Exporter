@@ -54,6 +54,7 @@
   <label><input type="checkbox" id="skel"> skeleton</label>
   <label><input type="checkbox" id="skin" checked> skinning</label>
   <label><input type="checkbox" id="particles" checked> particle markers</label>
+  <label><input type="checkbox" id="emittermeshes"> emitter meshes</label>
 </div>
 <div id="animbar" style="display:none">
   <select id="clipSelect"></select>
@@ -364,7 +365,17 @@ function buildScene(model, bin, textureUrlFor) {
     sceneNodeObjs.roots.forEach(r => r.updateMatrixWorld(true));
   }
 
-  for (const m of model.meshes) {
+  // Builds one THREE mesh/SkinnedMesh from a MeshData entry (m) and parents
+  // it under `group`/the right skeleton bone or scene node -- the ordinary
+  // per-mesh build shared between model.meshes and model.emitterMeshes
+  // (identical MeshData shape, see SceneModel.hpp), so an emitter-surface
+  // mesh gets the exact same transform/parenting/skinning path as a real
+  // rendered mesh and will follow an animated bone exactly like one does.
+  // `materialFor`, when given, replaces the normal NiAlphaProperty-derived
+  // MeshStandardMaterial construction -- used for the tinted/wireframe
+  // emitter-mesh look (Phase 5 emitter-mesh viewer mode) instead of the
+  // model's own textured look.
+  function buildOneMesh(m, materialFor) {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', attr(bin, m.attributes.position));
 
@@ -395,42 +406,9 @@ function buildScene(model, bin, textureUrlFor) {
     if (!n) g.computeVertexNormals();
     g.computeBoundingSphere();
 
-    const params = {
-      side: THREE.DoubleSide,   // GF meshes are frequently single-sided planes
-      wireframe: wire,
-      vertexColors: useVcol,
-      metalness: 0.0,
-      roughness: 0.85,
-    };
-    if (mat.diffuse) params.color = new THREE.Color(...mat.diffuse);
+    const material = materialFor ? materialFor(mat, useVcol) : buildStandardMaterial(mat, useVcol);
 
-    // NiAlphaProperty -> THREE.MeshStandardMaterial.
-    //
-    // Blend and test are genuinely different things and need different
-    // depthWrite: blending needs depthWrite:false or a transparent surface
-    // wrongly occludes whatever is behind it (writes to the depth buffer as
-    // if it were opaque) -- this is exactly the "parasitic opaque plate"
-    // symptom that motivated this fix. Alpha testing instead discards pixels
-    // outright before shading, so what's left really is opaque and keeping
-    // depthWrite:true is correct (and desirable -- cutout foliage/hair still
-    // wants to occlude what's behind the kept pixels).
-    const blend = !!mat.alphaBlendEnabled;
-    const test = !!mat.alphaTestEnabled;
-    params.opacity = mat.alpha !== undefined ? mat.alpha : 1;
-    if (blend || params.opacity < 1) {
-      params.transparent = true;
-      params.depthWrite = false;
-    }
-    if (test) {
-      params.alphaTest = (mat.alphaTestThreshold ?? 0) / 255;
-      // Alpha test on its own does not need `transparent`, and if blending is
-      // also on, depthWrite stays false from the branch above.
-      if (!blend) params.depthWrite = true;
-    }
-
-    const material = new THREE.MeshStandardMaterial(params);
-
-    if (showTex && mat.textureFound && mat.diffuseTexturePath) {
+    if (!materialFor && showTex && mat.textureFound && mat.diffuseTexturePath) {
       const url = textureUrlFor(mat.diffuseTexturePath);
       if (url) {
         const t = loader.load(url,
@@ -442,10 +420,11 @@ function buildScene(model, bin, textureUrlFor) {
         t.flipY = false;
         material.map = t;
       }
-    } else if (mat.sourceTextureName && !mat.textureFound) {
+    } else if (!materialFor && mat.sourceTextureName && !mat.textureFound) {
       notes.push(`<span class="warn">unresolved texture: ${mat.sourceTextureName}</span>`);
     }
 
+    let obj;
     if (skinned) {
       const sk = skeletons[m.skeletonIndex];
       // skinIndex values index this mesh's OWN binding list (glTF "joints"),
@@ -468,6 +447,7 @@ function buildScene(model, bin, textureUrlFor) {
       sm.bind(new THREE.Skeleton(meshBones, boneInverses), new THREE.Matrix4());
       sm.frustumCulled = false; // bounds are for the bind pose, not the skin
       group.add(sm);
+      obj = sm;
     } else {
       const plainMesh = new THREE.Mesh(g, material);
       // A mesh whose own node (or an ancestor) carries a real animation
@@ -479,6 +459,80 @@ function buildScene(model, bin, textureUrlFor) {
       // while the empty node animates on its own.
       const owner = m.nodeIndex >= 0 && sceneNodeObjs ? sceneNodeObjs.objs[m.nodeIndex] : null;
       (owner || group).add(plainMesh);
+      obj = plainMesh;
+    }
+    return obj;
+  }
+
+  // NiAlphaProperty -> THREE.MeshStandardMaterial, the model's normal
+  // textured/lit material construction (unchanged from before the
+  // emitter-mesh refactor).
+  //
+  // Blend and test are genuinely different things and need different
+  // depthWrite: blending needs depthWrite:false or a transparent surface
+  // wrongly occludes whatever is behind it (writes to the depth buffer as
+  // if it were opaque) -- this is exactly the "parasitic opaque plate"
+  // symptom that motivated this fix. Alpha testing instead discards pixels
+  // outright before shading, so what's left really is opaque and keeping
+  // depthWrite:true is correct (and desirable -- cutout foliage/hair still
+  // wants to occlude what's behind the kept pixels).
+  function buildStandardMaterial(mat, useVcol) {
+    const params = {
+      side: THREE.DoubleSide,   // GF meshes are frequently single-sided planes
+      wireframe: wire,
+      vertexColors: useVcol,
+      metalness: 0.0,
+      roughness: 0.85,
+    };
+    if (mat.diffuse) params.color = new THREE.Color(...mat.diffuse);
+
+    const blend = !!mat.alphaBlendEnabled;
+    const test = !!mat.alphaTestEnabled;
+    params.opacity = mat.alpha !== undefined ? mat.alpha : 1;
+    if (blend || params.opacity < 1) {
+      params.transparent = true;
+      params.depthWrite = false;
+    }
+    if (test) {
+      params.alphaTest = (mat.alphaTestThreshold ?? 0) / 255;
+      // Alpha test on its own does not need `transparent`, and if blending is
+      // also on, depthWrite stays false from the branch above.
+      if (!blend) params.depthWrite = true;
+    }
+
+    return new THREE.MeshStandardMaterial(params);
+  }
+
+  for (const m of model.meshes) {
+    buildOneMesh(m, null);
+  }
+
+  // Emitter-mesh visualisation (Phase 5 correctif, PHASE5_FINDINGS §12): the
+  // hidden emission-surface geometry rescued from Phase 3's visibility
+  // filter into SceneData::emitterMeshes. Built through the exact same
+  // buildOneMesh() path as a real mesh -- same nodeIndex/skinning/parenting
+  // -- specifically so this is an end-to-end check that these surfaces sit
+  // where the game shows effects and follow the same animated bone a real
+  // mesh would, not just a structural index check. Rendered tinted +
+  // semi-transparent (never with the model's own texture) so it reads as a
+  // diagnostic overlay and can never be confused with real geometry; a
+  // dedicated toggle, off by default, keeps this out of the way of the
+  // ordinary model-inspection flow.
+  const emitterMeshMat = () => new THREE.MeshBasicMaterial({
+    color: 0x33d0ff,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.6,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  if (document.getElementById('emittermeshes').checked) {
+    for (const m of model.emitterMeshes || []) {
+      const obj = buildOneMesh(m, emitterMeshMat);
+      const label = document.createElement('div');
+      label.textContent = m.name || '(unnamed emitter mesh)';
+      label.style.cssText = 'color:#33d0ff;font:11px ui-monospace,monospace;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;';
+      obj.add(new CSS2DObject(label));
     }
   }
 
@@ -601,12 +655,18 @@ function show(model, bin, textureUrlFor) {
     ? `particle systems ${psys.length}   (markers shown: ${psys.length - unresolvedParticleMarkers})`
     : null;
 
+  const emitterMeshes = model.emitterMeshes || [];
+  const emitterMeshLine = emitterMeshes.length
+    ? `emitter meshes ${emitterMeshes.length}   (toggle "emitter meshes" to view)`
+    : null;
+
   log([
     `<span class="ok">${model.sourceNif}</span>`,
     `meshes ${model.meshes.length}  (${strips} from NiTriStrips)   materials ${model.materials.length}`,
     `vertices ${verts.toLocaleString()}   triangles ${tris.toLocaleString()}   degenerate dropped ${degen.toLocaleString()}`,
     skinLine,
     ...(psysLine ? [psysLine] : []),
+    ...(emitterMeshLine ? [emitterMeshLine] : []),
     missing ? `<span class="warn">${missing} material(s) with unresolved textures</span>` : `<span class="ok">all textures resolved</span>`,
     ...new Set(notes),
   ].join('\n'));
@@ -715,7 +775,7 @@ document.getElementById('load').onclick = () => {
 pathInput.onkeydown = e => { if (e.key === 'Enter') document.getElementById('load').click(); };
 document.getElementById('files').onchange = e => loadFromFiles(e.target.files);
 
-for (const id of ['wire', 'tex', 'vcol', 'zup', 'skel', 'skin', 'particles']) {
+for (const id of ['wire', 'tex', 'vcol', 'zup', 'skel', 'skin', 'particles', 'emittermeshes']) {
   document.getElementById(id).onchange = () => { if (lastReload) lastReload(); };
 }
 
