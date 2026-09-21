@@ -40,6 +40,10 @@ struct ExtractionResult {
     /*! Animation measurements for this file, merged into a corpus total by the
      *  caller. */
     AnimationStats animation;
+
+    /*! Particle-system measurements for this file, merged into a corpus total
+     *  by the caller. */
+    ParticleStats particles;
 };
 
 /*! True if `nifPath` (a .nif under a `<type>/model/` directory) has a

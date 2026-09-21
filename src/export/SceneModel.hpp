@@ -411,6 +411,56 @@ struct AnimationStats {
     }
 };
 
+/*! Corpus-wide measurements about particle extraction (Phase 5), accumulated
+ *  across a run -- the evidence for the emitter/modifier coverage decisions.
+ *  See PHASE5_FINDINGS. */
+struct ParticleStats {
+    int filesWithParticles = 0;
+    int systemsTotal = 0;
+    int systemsAttachNodeResolved = 0;
+    int systemsAttachNodeOrphaned = 0;
+    int systemsMaterialResolved = 0;
+    int systemsTextureFound = 0;
+
+    int emittersBox = 0;
+    int emittersMesh = 0;
+    /*! An emitter type this exporter does not recognise -- none measured in
+     *  the corpus (only Box/Mesh occur, PHASE5_FINDINGS Etape 1), kept so a
+     *  future corpus update is visible rather than silently mis-extracted. */
+    int emittersUnsupported = 0;
+    int emitterObjectResolved = 0;
+
+    int modifiersGravity = 0;
+    int modifiersRotation = 0;
+    int modifiersGrowFade = 0;
+    int modifiersColor = 0;
+    int modifiersColorKeysMissing = 0;
+    int gravityObjectResolved = 0;
+    /*! A modifier type not in this exporter's known set at all (not even as
+     *  a type-only boilerplate entry) -- skipped with a warning. */
+    int modifiersUnsupported = 0;
+
+    void Merge(const ParticleStats& o) {
+        filesWithParticles += o.filesWithParticles;
+        systemsTotal += o.systemsTotal;
+        systemsAttachNodeResolved += o.systemsAttachNodeResolved;
+        systemsAttachNodeOrphaned += o.systemsAttachNodeOrphaned;
+        systemsMaterialResolved += o.systemsMaterialResolved;
+        systemsTextureFound += o.systemsTextureFound;
+        emittersBox += o.emittersBox;
+        emittersMesh += o.emittersMesh;
+        emittersUnsupported += o.emittersUnsupported;
+        emitterObjectResolved += o.emitterObjectResolved;
+        modifiersGravity += o.modifiersGravity;
+        modifiersRotation += o.modifiersRotation;
+        modifiersGrowFade += o.modifiersGrowFade;
+        modifiersColor += o.modifiersColor;
+        modifiersColorKeysMissing += o.modifiersColorKeysMissing;
+        gravityObjectResolved += o.gravityObjectResolved;
+        modifiersUnsupported += o.modifiersUnsupported;
+    }
+};
+
 /*! One translation/scale keyframe: a time and a 3-component value. */
 struct VectorKey {
     float time = 0.0f;
@@ -475,10 +525,177 @@ struct AnimationClip {
     std::vector<AnimationTrack> tracks;
 };
 
-/*! One converted .nif.
+/*! One color/alpha keyframe of a particle system's color-over-life curve
+ *  (NiPSysColorModifier's NiColorData). `time` is normalised 0..1 across a
+ *  particle's own lifespan, exactly as NiColorData stores it for this use
+ *  (see PHASE5_FINDINGS) -- not a scene/clip time. */
+struct ParticleColorKey {
+    float time = 0.0f;
+    float value[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+/*! One particle emitter. Every NiParticleSystem in the corpus has exactly one
+ *  emitter (measured, see PHASE5_FINDINGS Etape 1) so this is not a vector.
  *
- *  Phase 5 will add particleSystems. The writer already emits that JSON key
- *  as empty so the schema does not change shape later. */
+ *  Values are copied straight from the NIF's own fields/units -- angles in
+ *  radians as NiPSysEmitter stores them, no conversion to a render engine's
+ *  convention -- per this project's standing principle (Z-up, raw alpha
+ *  blend enums) of keeping translation to the loader's job. */
+struct ParticleEmitterData {
+    /*! Raw NIF type name: "NiPSysBoxEmitter" or "NiPSysMeshEmitter" -- the
+     *  only two emitter types found in the corpus (PHASE5_FINDINGS Etape 1).
+     *  A future emitter type this exporter does not recognise is skipped
+     *  with a warning rather than guessed at; see ParticleExtractor. */
+    std::string type;
+
+    // --- NiPSysEmitter base fields (both emitter types) ---
+    float speed = 0.0f;
+    float speedVariation = 0.0f;
+    /*! Radians, first emission cone axis. */
+    float declination = 0.0f;
+    float declinationVariation = 0.0f;
+    /*! Radians, second emission cone axis. */
+    float planarAngle = 0.0f;
+    float planarAngleVariation = 0.0f;
+    float initialColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float initialRadius = 0.0f;
+    float radiusVariation = 0.0f;
+    float lifeSpan = 0.0f;
+    float lifeSpanVariation = 0.0f;
+
+    // --- NiPSysBoxEmitter fields (type == "NiPSysBoxEmitter") ---
+    float boxWidth = 0.0f;
+    float boxHeight = 0.0f;
+    float boxDepth = 0.0f;
+
+    // --- NiPSysMeshEmitter fields (type == "NiPSysMeshEmitter") ---
+    /*! Raw NIF enum values (Niflib::VelocityType / EmitFrom) -- kept as ints
+     *  rather than translated, same principle as MaterialData's blend enums. */
+    int meshInitialVelocityType = 0;
+    int meshEmissionType = 0;
+    float meshEmissionAxis[3] = {1.0f, 0.0f, 0.0f};
+    /*! Names of the NiTriShape/NiTriStrips this emitter emits from, kept for
+     *  diagnostics -- a consumer emits from the *attached* geometry's own
+     *  exported mesh, not from this list directly. */
+    std::vector<std::string> meshEmitterMeshNames;
+
+    /*! Index into SceneData::skeletons[skeletonIndex].bones or
+     *  SceneData::nodes (whichever the owning ParticleSystemData resolves
+     *  against), or -1 when unresolved. This is NiPSysVolumeEmitter's own
+     *  "Emitter Object" -- the node the emitter's shape (box dimensions, or
+     *  the mesh-emitter's emission origin) is expressed relative to, which
+     *  is routinely a different node from the NiParticleSystem's own parent
+     *  (a sibling "<name>-Emitter" NiNode, see PHASE5_FINDINGS). Falls back
+     *  to the particle system's own attachNodeIndex when the emitter object
+     *  cannot be resolved. */
+    int emitterObjectNodeIndex = -1;
+};
+
+/*! One particle modifier attached to a NiParticleSystem, other than the
+ *  emitter itself (see ParticleSystemData::emitter).
+ *
+ *  Only the types actually varying in the corpus carry real fields here --
+ *  NiPSysAgeDeathModifier/BoundUpdateModifier/PositionModifier/SpawnModifier
+ *  are universal engine boilerplate attached to every system (measured
+ *  corpus-wide, PHASE5_FINDINGS Etape 1) with no per-effect authored
+ *  variation worth extracting, so `type` alone documents their presence. */
+struct ParticleModifierData {
+    /*! Raw NIF type name, e.g. "NiPSysGravityModifier". */
+    std::string type;
+
+    // --- NiPSysGravityModifier (type == "NiPSysGravityModifier") ---
+    float gravityAxis[3] = {0.0f, 0.0f, 1.0f};
+    float gravityDecay = 0.0f;
+    float gravityStrength = 0.0f;
+    /*! Raw NiPSysGravityModifier::ForceType enum value (0=Planar,
+     *  1=Spherical, 2=Unknown). */
+    int gravityForceType = 0;
+    float gravityTurbulence = 0.0f;
+    float gravityTurbulenceScale = 1.0f;
+    /*! Index into the same node/bone list as ParticleSystemData::attachNodeIndex,
+     *  or -1 when the modifier has no gravity object (a global/world-axis
+     *  force) or it could not be resolved. */
+    int gravityObjectNodeIndex = -1;
+
+    // --- NiPSysRotationModifier (type == "NiPSysRotationModifier") ---
+    float rotationInitialSpeed = 0.0f;
+    float rotationInitialSpeedVariation = 0.0f;
+    float rotationInitialAngle = 0.0f;
+    float rotationInitialAngleVariation = 0.0f;
+    bool rotationRandomSpeedSign = false;
+    bool rotationRandomInitialAxis = true;
+    float rotationInitialAxis[3] = {1.0f, 0.0f, 0.0f};
+
+    // --- NiPSysGrowFadeModifier (type == "NiPSysGrowFadeModifier") ---
+    float growTime = 0.0f;
+    float fadeTime = 0.0f;
+
+    // --- NiPSysColorModifier (type == "NiPSysColorModifier") ---
+    /*! From this modifier's NiColorData, keys normalised 0..1 across a
+     *  particle's lifespan. Empty when the modifier had no data block. */
+    std::vector<ParticleColorKey> colorKeys;
+};
+
+/*! One particle system (NiParticleSystem), as needed to reproduce it with a
+ *  JS particle library (three.quarks or similar) in the Angular viewer --
+ *  see PHASE5_FINDINGS for the corpus measurements behind every field here.
+ *
+ *  This phase extracts parameters only: no simulation, no rendering. Values
+ *  stay in the NIF's own units/axes (Z-up, radians, NIF blend enums) exactly
+ *  like every other phase's data -- translation to a specific particle
+ *  library's conventions is the Angular loader's job. */
+struct ParticleSystemData {
+    /*! The NiParticleSystem's own name. */
+    std::string name;
+
+    /*! Index into SceneData::skeletons[0].bones or SceneData::nodes (never
+     *  both -- see SceneData::nodes), or -1 when the name could not be
+     *  resolved. This is the system's own PARENT node -- where it sits in
+     *  the scene graph -- which may be different from the emitter's own
+     *  shape-origin node (see ParticleEmitterData::emitterObjectNodeIndex).
+     *  A consumer parents the emitter under this node so it follows an
+     *  animated bone (PHASE5_FINDINGS: ~30% of systems in the corpus are
+     *  parented, directly or via an ancestor, under a node a companion .kf
+     *  actually animates). */
+    int attachNodeIndex = -1;
+    /*! True when attachNodeIndex resolves into SceneData::skeletons rather
+     *  than SceneData::nodes -- a file never has both populated (see
+     *  SceneData::nodes), but this makes which one unambiguous without the
+     *  consumer having to check both vectors' sizes. */
+    bool attachNodeIsBone = false;
+
+    /*! This system's own local transform in attachNodeIndex's space
+     *  (NiParticleSystem::GetLocalTransform() -- particle systems have their
+     *  own translation/rotation/scale like any NiAVObject, on top of
+     *  whichever node they are parented under). Column-major. */
+    float localMatrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    /*! NiPSysData::GetVertexCount() (inherited from NiGeometryData) -- the
+     *  size the source pre-allocated its particle arrays to, i.e. the
+     *  maximum number of simultaneously live particles this system was
+     *  authored for. A real, typed getter (unlike most particle fields --
+     *  see PHASE5_FINDINGS Etape 1), since NiPSysData shares NiGeometryData
+     *  with ordinary meshes. */
+    int maxParticles = 0;
+
+    /*! Material/texture, reusing MaterialExtractor exactly as a mesh does --
+     *  a NiParticleSystem carries the same NiTexturingProperty/
+     *  NiMaterialProperty/NiAlphaProperty list a NiTriShape does. Index into
+     *  SceneData::materials, or -1 when the system carries no
+     *  material-bearing property at all. */
+    int materialIndex = -1;
+
+    ParticleEmitterData emitter;
+    /*! AgeDeath/BoundUpdate/Position/Spawn modifiers ARE included here (as
+     *  type-only entries, see ParticleModifierData) so a consumer can see
+     *  the full authored modifier stack, even though this phase does not
+     *  extract per-effect fields for them (measured corpus-wide as
+     *  boilerplate, PHASE5_FINDINGS). A modifier type this exporter does not
+     *  recognise at all is skipped with a warning -- see ParticleExtractor. */
+    std::vector<ParticleModifierData> modifiers;
+};
+
+/*! One converted .nif. */
 struct SceneData {
     std::string sourceNifPath;
     std::vector<MeshData> meshes;
@@ -497,6 +714,11 @@ struct SceneData {
     /*! Embedded animations plus every .kf found for this file under the
      *  <type>/animation/NAME.kf convention. Empty when the file has neither. */
     std::vector<AnimationClip> animations;
+
+    /*! Particle systems (NiParticleSystem), Phase 5. Empty when the file has
+     *  none -- measured at 55% of the corpus (PHASE5_FINDINGS), so this is
+     *  routinely non-empty, unlike the rarer skeleton/animation cases. */
+    std::vector<ParticleSystemData> particleSystems;
 
     /*! Total vertices/triangles across all meshes, for logging. */
     size_t TotalVertices() const {

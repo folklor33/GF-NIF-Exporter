@@ -186,6 +186,8 @@ int RunExport(const std::vector<std::string>& args) {
     gfnif::SkinningStats skinning;
     gfnif::AnimationStats animStats;
     int filesWithAnimation = 0;
+    gfnif::ParticleStats particleStats;
+    size_t totalParticleSystems = 0;
     size_t totalAnimationClips = 0, totalAnimationTracks = 0;
     std::vector<float> clipDurations;
     std::vector<int> tracksPerClip;
@@ -283,6 +285,9 @@ int RunExport(const std::vector<std::string>& args) {
             }
         }
 
+        particleStats.Merge(res.particles);
+        totalParticleSystems += scene.particleSystems.size();
+
         std::cout << "  -> " << outBase.string() << ".gfmodel/.gfbin\n";
         std::cout << "     " << scene.meshes.size() << " mesh(es), " << scene.materials.size()
                   << " material(s), " << scene.TotalVertices() << " verts, "
@@ -296,6 +301,9 @@ int RunExport(const std::vector<std::string>& args) {
         }
         if (!scene.animations.empty()) {
             std::cout << ", " << scene.animations.size() << " animation clip(s)";
+        }
+        if (!scene.particleSystems.empty()) {
+            std::cout << ", " << scene.particleSystems.size() << " particle system(s)";
         }
         std::cout << "\n";
 
@@ -445,6 +453,26 @@ int RunExport(const std::vector<std::string>& args) {
         std::cout << "Animated bones/clip : min " << sortedBones.front() << ", p50 "
                   << sortedBones[sortedBones.size() / 2] << ", max " << sortedBones.back() << "\n";
     }
+
+    std::cout << "\n--- particles ----------------------------------------------------\n";
+    std::cout << "Files with particles: " << particleStats.filesWithParticles << "\n";
+    std::cout << "Particle systems    : " << totalParticleSystems << "\n";
+    std::cout << "Attach node resolved: " << particleStats.systemsAttachNodeResolved << "/"
+              << particleStats.systemsTotal << "\n";
+    std::cout << "Material resolved   : " << particleStats.systemsMaterialResolved << "/"
+              << particleStats.systemsTotal << " (" << particleStats.systemsTextureFound
+              << " with texture found)\n";
+    std::cout << "Emitters            : " << particleStats.emittersBox << " Box, "
+              << particleStats.emittersMesh << " Mesh, " << particleStats.emittersUnsupported
+              << " unsupported\n";
+    std::cout << "Emitter object resolved: " << particleStats.emitterObjectResolved << "/"
+              << (particleStats.emittersBox + particleStats.emittersMesh) << "\n";
+    std::cout << "Modifiers           : " << particleStats.modifiersGravity << " Gravity ("
+              << particleStats.gravityObjectResolved << " with object resolved), "
+              << particleStats.modifiersRotation << " Rotation, " << particleStats.modifiersGrowFade
+              << " GrowFade, " << particleStats.modifiersColor << " Color ("
+              << particleStats.modifiersColorKeysMissing << " missing data), "
+              << particleStats.modifiersUnsupported << " unrecognised\n";
 
     if (!orphanBoneNames.empty()) {
         std::vector<std::pair<std::string, int>> orphans(orphanBoneNames.begin(),

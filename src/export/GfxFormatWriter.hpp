@@ -22,6 +22,6 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
 
 /*! Format version written into the .gfmodel. Bumped when the schema changes in
  *  a way a consumer must notice. */
-constexpr int kGfModelFormatVersion = 2;
+constexpr int kGfModelFormatVersion = 3;
 
 } // namespace gfnif

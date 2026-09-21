@@ -83,6 +83,7 @@ add_executable(gfnif-export
     src/nif/MeshExtractor.cpp
     src/nif/NameClassifier.cpp
     src/nif/NifDumper.cpp
+    src/nif/ParticleExtractor.cpp
     src/nif/SkeletonExtractor.cpp
     src/texture/TextureResolver.cpp
 )

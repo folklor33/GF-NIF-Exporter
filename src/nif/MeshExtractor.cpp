@@ -4,6 +4,7 @@
 #include "nif/HeaderNormalizer.hpp"
 #include "nif/MaterialExtractor.hpp"
 #include "nif/NameClassifier.hpp"
+#include "nif/ParticleExtractor.hpp"
 #include "nif/SkeletonExtractor.hpp"
 #include "texture/TextureResolver.hpp"
 
@@ -577,10 +578,41 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
             }
         }
 
-        // Only a file that actually gained a clip while resolving against the
-        // node list needs it exported; every other skeleton-less file (the
-        // large majority, per PHASE4_FINDINGS) keeps scene.nodes empty.
-        if (nodesPtr != nullptr && scene.animations.size() > clipsBefore) {
+        // Particle systems (Phase 5), resolved against the same
+        // skeleton/node list animation just used. Unlike animation, a
+        // particle system's attach point needs resolving whether or not
+        // anything in the file animates -- a static emitter parented under a
+        // plain NiNode is just as real a "needs the node list" case as a
+        // moving one (measured: half of the corpus's particle-bearing files
+        // are skeleton-less, with or without a companion .kf -- see
+        // PHASE5_FINDINGS). nodesPtr/skeleton are already built above
+        // unconditionally when skeleton == nullptr, so this costs nothing
+        // extra to attempt.
+        const size_t particlesBefore = scene.particleSystems.size();
+        {
+            ParticleExtractor particleExtractor(&result.warnings);
+            for (const NiObjectRef& b : blocks) {
+                NiObject* obj = static_cast<NiObject*>(b);
+                if (referenced.find(obj) != referenced.end()) {
+                    continue;
+                }
+                if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
+                    particleExtractor.Extract(av, skeleton, nodesPtr, materials, scene,
+                                              result.particles);
+                }
+            }
+        }
+        if (scene.particleSystems.size() > particlesBefore) {
+            result.particles.filesWithParticles = 1;
+        }
+
+        // A file needs its node list exported (see SceneData::nodes) when
+        // EITHER an animation track resolved against it (PHASE4_FINDINGS'
+        // original reason) OR a particle system's attach/emitter/gravity
+        // object did (this phase's addition) -- every other skeleton-less
+        // file (the large majority) keeps scene.nodes empty.
+        if (nodesPtr != nullptr &&
+            (scene.animations.size() > clipsBefore || scene.particleSystems.size() > particlesBefore)) {
             // Reattach every mesh whose own node (or an ancestor of it) is
             // actually the target of a resolved track. Without this, a track
             // moves an empty SceneNode pivot while the mesh's geometry --

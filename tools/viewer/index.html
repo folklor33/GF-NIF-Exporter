@@ -53,6 +53,7 @@
   <label><input type="checkbox" id="zup" checked> Z-up &rarr; Y-up</label>
   <label><input type="checkbox" id="skel"> skeleton</label>
   <label><input type="checkbox" id="skin" checked> skinning</label>
+  <label><input type="checkbox" id="particles" checked> particle markers</label>
 </div>
 <div id="animbar" style="display:none">
   <select id="clipSelect"></select>
@@ -72,6 +73,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 const statsEl = document.getElementById('stats');
 const log = (html) => { statsEl.innerHTML = html; };
@@ -85,6 +87,18 @@ document.body.appendChild(renderer.domElement);
 renderer.domElement.style.position = 'fixed';
 renderer.domElement.style.inset = '0';
 renderer.domElement.style.zIndex = '1';
+
+// CSS2DRenderer draws the particle-marker name labels as ordinary DOM text
+// that stays screen-facing and correctly sized regardless of camera distance
+// -- simpler and cheaper than a sprite-based text texture for a diagnostic
+// overlay that is never meant to ship in the Angular consumer.
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+labelRenderer.domElement.style.position = 'fixed';
+labelRenderer.domElement.style.inset = '0';
+labelRenderer.domElement.style.zIndex = '2';
+labelRenderer.domElement.style.pointerEvents = 'none';
+document.body.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x15171c);
@@ -119,6 +133,7 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  labelRenderer.setSize(innerWidth, innerHeight);
 });
 
 const clock = new THREE.Clock();
@@ -136,6 +151,7 @@ const clock = new THREE.Clock();
     clock.getDelta(); // keep the clock from jumping when playback resumes
   }
   renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
 })();
 
 // ------------------------------------------------------------------- building
@@ -276,6 +292,46 @@ function buildSceneNodes(nodes) {
     else objs[n.parent].add(objs[i]);
   });
   return { objs, roots };
+}
+
+// Places one small marker sphere + name label per exported particle system
+// (Phase 5), parented under whichever bone/node its own attachNodeIndex
+// resolved to -- exactly the mechanism buildAnimationClips already uses for
+// bone/node tracks, so a marker under an animated bone moves with it for
+// free via THREE's own matrix propagation, with no separate animation code
+// needed here. This is the "does the attach point follow the right node"
+// end-to-end check the brief asks for: no particle simulation is rendered,
+// only where an emitter WOULD sit and whether it tracks its bone correctly.
+function buildParticleMarkers(model, skeletons, sceneNodeObjs) {
+  const markerGeo = new THREE.SphereGeometry(0.03, 8, 6);
+  const markerMat = new THREE.MeshBasicMaterial({ color: 0xff5fd1, depthTest: false });
+  const markers = [];
+  let unresolved = 0;
+
+  for (const p of model.particleSystems || []) {
+    let parent = null;
+    if (p.attachNodeIndex >= 0) {
+      parent = p.attachNodeIsBone
+        ? (skeletons[0] && skeletons[0].bones[p.attachNodeIndex])
+        : (sceneNodeObjs && sceneNodeObjs.objs[p.attachNodeIndex]);
+    }
+    if (!parent) { unresolved++; continue; }
+
+    const marker = new THREE.Mesh(markerGeo, markerMat);
+    // The particle system's own local transform on top of its attach node,
+    // exactly as ParticleSystemData::localMatrix documents.
+    new THREE.Matrix4().fromArray(p.localMatrix)
+      .decompose(marker.position, marker.quaternion, marker.scale);
+
+    const label = document.createElement('div');
+    label.textContent = p.name || '(unnamed)';
+    label.style.cssText = 'color:#ff9fe6;font:11px ui-monospace,monospace;text-shadow:0 0 3px #000,0 0 3px #000;white-space:nowrap;';
+    marker.add(new CSS2DObject(label));
+
+    parent.add(marker); // rides the attach bone/node's own matrix automatically
+    markers.push(marker);
+  }
+  return { markers, unresolved };
 }
 
 function buildScene(model, bin, textureUrlFor) {
@@ -454,9 +510,20 @@ function buildScene(model, bin, textureUrlFor) {
     group.rotation.x = -Math.PI / 2;
   }
 
+  let particleMarkers = [];
+  let unresolvedParticleMarkers = 0;
+  if (document.getElementById('particles').checked && (model.particleSystems || []).length) {
+    const { markers, unresolved } = buildParticleMarkers(model, skeletons, sceneNodeObjs);
+    particleMarkers = markers;
+    unresolvedParticleMarkers = unresolved;
+    if (unresolved) {
+      notes.push(`<span class="warn">${unresolved} particle system(s) with an unresolved attach node (no marker shown)</span>`);
+    }
+  }
+
   const clips = buildAnimationClips(model, bin);
   const allBones = skeletons.flatMap(sk => sk.bones).concat(sceneNodeObjs ? sceneNodeObjs.objs : []);
-  return { group, notes, clips, allBones };
+  return { group, notes, clips, allBones, particleMarkers, unresolvedParticleMarkers };
 }
 
 function frame(group) {
@@ -490,9 +557,14 @@ function show(model, bin, textureUrlFor) {
   root.traverse(o => {
     if (o.geometry) o.geometry.dispose();
     if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+    // CSS2DObject labels are plain DOM nodes parented into labelRenderer's own
+    // element tree, outside the WebGL scene graph -- traverse() still visits
+    // them (they're THREE.Object3D children), but they need their DOM element
+    // removed explicitly or the old model's labels linger on screen.
+    if (o.isCSS2DObject) o.element.remove();
   });
 
-  const { group, notes, clips, allBones } = buildScene(model, bin, textureUrlFor);
+  const { group, notes, clips, allBones, unresolvedParticleMarkers } = buildScene(model, bin, textureUrlFor);
   root = group;
   scene.add(root);
   frame(root);
@@ -524,11 +596,17 @@ function show(model, bin, textureUrlFor) {
       `skinned meshes ${skinnedMeshes}/${model.meshes.length}`
     : `<span class="warn">no skeleton (static model)</span>`;
 
+  const psys = model.particleSystems || [];
+  const psysLine = psys.length
+    ? `particle systems ${psys.length}   (markers shown: ${psys.length - unresolvedParticleMarkers})`
+    : null;
+
   log([
     `<span class="ok">${model.sourceNif}</span>`,
     `meshes ${model.meshes.length}  (${strips} from NiTriStrips)   materials ${model.materials.length}`,
     `vertices ${verts.toLocaleString()}   triangles ${tris.toLocaleString()}   degenerate dropped ${degen.toLocaleString()}`,
     skinLine,
+    ...(psysLine ? [psysLine] : []),
     missing ? `<span class="warn">${missing} material(s) with unresolved textures</span>` : `<span class="ok">all textures resolved</span>`,
     ...new Set(notes),
   ].join('\n'));
@@ -637,7 +715,7 @@ document.getElementById('load').onclick = () => {
 pathInput.onkeydown = e => { if (e.key === 'Enter') document.getElementById('load').click(); };
 document.getElementById('files').onchange = e => loadFromFiles(e.target.files);
 
-for (const id of ['wire', 'tex', 'vcol', 'zup', 'skel', 'skin']) {
+for (const id of ['wire', 'tex', 'vcol', 'zup', 'skel', 'skin', 'particles']) {
   document.getElementById(id).onchange = () => { if (lastReload) lastReload(); };
 }
 

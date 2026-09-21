@@ -252,7 +252,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::ostringstream js;
     js << "{\n";
     js << "  \"formatVersion\": " << kGfModelFormatVersion << ",\n";
-    js << "  \"generator\": \"gfnif-export (phase 4)\",\n";
+    js << "  \"generator\": \"gfnif-export (phase 5)\",\n";
     js << "  \"sourceNif\": \"" << JsonEscape(scene.sourceNifPath) << "\",\n";
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
@@ -430,10 +430,105 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     }
     js << "  ],\n";
 
-    // Reserved for a later phase. Emitted as empty rather than omitted so the
-    // schema keeps its shape, but deliberately NOT pre-filled with a guessed
-    // structure -- phase 5 will define this.
-    js << "  \"particleSystems\": []\n";
+    // Particle systems (Phase 5): parameters only, no simulation data. Values
+    // stay in the NIF's own units/enums (see SceneModel.hpp's
+    // ParticleSystemData) -- a consumer's particle library does the
+    // translation, same principle as every other raw-NIF-value field this
+    // exporter writes.
+    js << "  \"particleSystems\": [\n";
+    for (size_t i = 0; i < scene.particleSystems.size(); ++i) {
+        const ParticleSystemData& p = scene.particleSystems[i];
+        js << "    {\n";
+        js << "      \"name\": \"" << JsonEscape(p.name) << "\",\n";
+        js << "      \"attachNodeIndex\": " << p.attachNodeIndex << ",\n";
+        js << "      \"attachNodeIsBone\": " << (p.attachNodeIsBone ? "true" : "false") << ",\n";
+        js << "      \"localMatrix\": " << Mat4Json(p.localMatrix) << ",\n";
+        js << "      \"maxParticles\": " << p.maxParticles << ",\n";
+        js << "      \"materialIndex\": " << p.materialIndex << ",\n";
+
+        const ParticleEmitterData& e = p.emitter;
+        js << "      \"emitter\": {\n";
+        js << "        \"type\": \"" << JsonEscape(e.type) << "\",\n";
+        js << "        \"speed\": " << Num(e.speed) << ",\n";
+        js << "        \"speedVariation\": " << Num(e.speedVariation) << ",\n";
+        js << "        \"declination\": " << Num(e.declination) << ",\n";
+        js << "        \"declinationVariation\": " << Num(e.declinationVariation) << ",\n";
+        js << "        \"planarAngle\": " << Num(e.planarAngle) << ",\n";
+        js << "        \"planarAngleVariation\": " << Num(e.planarAngleVariation) << ",\n";
+        js << "        \"initialColor\": [" << Num(e.initialColor[0]) << ", " << Num(e.initialColor[1])
+           << ", " << Num(e.initialColor[2]) << ", " << Num(e.initialColor[3]) << "],\n";
+        js << "        \"initialRadius\": " << Num(e.initialRadius) << ",\n";
+        js << "        \"radiusVariation\": " << Num(e.radiusVariation) << ",\n";
+        js << "        \"lifeSpan\": " << Num(e.lifeSpan) << ",\n";
+        js << "        \"lifeSpanVariation\": " << Num(e.lifeSpanVariation) << ",\n";
+        js << "        \"boxWidth\": " << Num(e.boxWidth) << ",\n";
+        js << "        \"boxHeight\": " << Num(e.boxHeight) << ",\n";
+        js << "        \"boxDepth\": " << Num(e.boxDepth) << ",\n";
+        js << "        \"meshInitialVelocityType\": " << e.meshInitialVelocityType << ",\n";
+        js << "        \"meshEmissionType\": " << e.meshEmissionType << ",\n";
+        js << "        \"meshEmissionAxis\": " << Vec3Json(e.meshEmissionAxis) << ",\n";
+        js << "        \"meshEmitterMeshNames\": [";
+        for (size_t m = 0; m < e.meshEmitterMeshNames.size(); ++m) {
+            js << (m ? ", " : "") << "\"" << JsonEscape(e.meshEmitterMeshNames[m]) << "\"";
+        }
+        js << "],\n";
+        js << "        \"emitterObjectNodeIndex\": " << e.emitterObjectNodeIndex << "\n";
+        js << "      },\n";
+
+        // Only the fields meaningful for each modifier's own type are
+        // written -- the boilerplate types (AgeDeath/BoundUpdate/Position/
+        // Spawn, see SceneModel.hpp) get "type" alone, so a consumer is never
+        // shown a "gravityStrength": 0 on a modifier that has no such
+        // concept rather than a genuinely-zero one.
+        js << "      \"modifiers\": [\n";
+        for (size_t m = 0; m < p.modifiers.size(); ++m) {
+            const ParticleModifierData& mod = p.modifiers[m];
+            js << "        {\n";
+            js << "          \"type\": \"" << JsonEscape(mod.type) << "\"";
+            if (mod.type == "NiPSysGravityModifier") {
+                js << ",\n          \"gravityAxis\": " << Vec3Json(mod.gravityAxis) << ",\n";
+                js << "          \"gravityDecay\": " << Num(mod.gravityDecay) << ",\n";
+                js << "          \"gravityStrength\": " << Num(mod.gravityStrength) << ",\n";
+                js << "          \"gravityForceType\": " << mod.gravityForceType << ",\n";
+                js << "          \"gravityTurbulence\": " << Num(mod.gravityTurbulence) << ",\n";
+                js << "          \"gravityTurbulenceScale\": " << Num(mod.gravityTurbulenceScale)
+                   << ",\n";
+                js << "          \"gravityObjectNodeIndex\": " << mod.gravityObjectNodeIndex << "\n";
+            } else if (mod.type == "NiPSysRotationModifier") {
+                js << ",\n          \"rotationInitialSpeed\": " << Num(mod.rotationInitialSpeed)
+                   << ",\n";
+                js << "          \"rotationInitialSpeedVariation\": "
+                   << Num(mod.rotationInitialSpeedVariation) << ",\n";
+                js << "          \"rotationInitialAngle\": " << Num(mod.rotationInitialAngle) << ",\n";
+                js << "          \"rotationInitialAngleVariation\": "
+                   << Num(mod.rotationInitialAngleVariation) << ",\n";
+                js << "          \"rotationRandomSpeedSign\": "
+                   << (mod.rotationRandomSpeedSign ? "true" : "false") << ",\n";
+                js << "          \"rotationRandomInitialAxis\": "
+                   << (mod.rotationRandomInitialAxis ? "true" : "false") << ",\n";
+                js << "          \"rotationInitialAxis\": " << Vec3Json(mod.rotationInitialAxis)
+                   << "\n";
+            } else if (mod.type == "NiPSysGrowFadeModifier") {
+                js << ",\n          \"growTime\": " << Num(mod.growTime) << ",\n";
+                js << "          \"fadeTime\": " << Num(mod.fadeTime) << "\n";
+            } else if (mod.type == "NiPSysColorModifier") {
+                js << ",\n          \"colorKeys\": [";
+                for (size_t k = 0; k < mod.colorKeys.size(); ++k) {
+                    const ParticleColorKey& ck = mod.colorKeys[k];
+                    js << (k ? ", " : "") << "{\"time\": " << Num(ck.time) << ", \"value\": ["
+                       << Num(ck.value[0]) << ", " << Num(ck.value[1]) << ", " << Num(ck.value[2])
+                       << ", " << Num(ck.value[3]) << "]}";
+                }
+                js << "]\n";
+            } else {
+                js << "\n";
+            }
+            js << "        }" << (m + 1 < p.modifiers.size() ? "," : "") << "\n";
+        }
+        js << "      ]\n";
+        js << "    }" << (i + 1 < scene.particleSystems.size() ? "," : "") << "\n";
+    }
+    js << "  ]\n";
     js << "}\n";
 
     {
