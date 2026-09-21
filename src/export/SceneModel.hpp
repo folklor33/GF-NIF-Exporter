@@ -534,6 +534,151 @@ struct AnimationTrack {
     std::vector<VectorKey> scales;
 };
 
+/*! What a MaterialTrack drives.
+ *
+ *  A material controller does NOT target a material: it targets a *geometry*
+ *  (or the property list of one). SceneData::materials is deduplicated --
+ *  MaterialExtractor merges two interchangeable materials into one entry -- so
+ *  two glow planes with the same texture and colours share a material index
+ *  even when only one of them scrolls. Addressing the material would animate
+ *  both. Addressing the geometry lets a consumer clone the material for the
+ *  meshes that actually carry a track, and leave the rest alone. */
+struct MaterialTrackTarget {
+    enum class Array {
+        Meshes,          //!< SceneData::meshes
+        EmitterMeshes,   //!< SceneData::emitterMeshes
+        ParticleSystems, //!< SceneData::particleSystems
+        Nodes,           //!< SceneData::nodes
+        Bones,           //!< SceneData::skeletons[0].bones
+    };
+    Array array = Array::Meshes;
+    /*! Index into that array, or -1 when the name could not be resolved. An
+     *  unresolved track is still emitted (same policy as AnimationTrack) so
+     *  the resolution rate is measurable from the exported data itself. */
+    int index = -1;
+    /*! The target name exactly as the source spells it. For a .kf track this
+     *  is ControllerLink::nodeName, which is all the .kf carries -- see
+     *  MaterialAnimationStats::kfAmbiguousTargets. */
+    std::string name;
+};
+
+/*! Which property of the target a MaterialTrack animates.
+ *
+ *  Deliberately one scalar-or-vector channel per track, mirroring how the NIF
+ *  stores them: a NiTextureTransformController drives exactly one of the five
+ *  UV transforms, never several. */
+enum class MaterialTrackProperty {
+    UvTranslateU,  //!< TT_TRANSLATE_U, 1 float
+    UvTranslateV,  //!< TT_TRANSLATE_V, 1 float
+    UvRotation,    //!< TT_ROTATE, 1 float, radians as the NIF stores it
+    UvScaleU,      //!< TT_SCALE_U, 1 float
+    UvScaleV,      //!< TT_SCALE_V, 1 float
+    Alpha,         //!< NiAlphaController, 1 float, 1 = opaque
+    AmbientColor,  //!< NiMaterialColorController TC_AMBIENT, 3 floats
+    DiffuseColor,  //!< TC_DIFFUSE, 3 floats
+    SpecularColor, //!< TC_SPECULAR, 3 floats
+    EmissiveColor, //!< TC_SELF_ILLUM, 3 floats
+    Visible,       //!< NiVisController, 1 float, 0 or 1
+    TextureIndex,  //!< NiFlipController, 1 float, index into flipTextures
+};
+
+/*! One texture of a NiFlipController's flipbook, resolved the same way a
+ *  material's diffuse texture is (see MaterialData). */
+struct FlipTexture {
+    std::string path;              //!< resolved .png, relative to the input root
+    std::string sourceTextureName; //!< the .dds path as written in the NIF
+    bool found = false;
+};
+
+/*! Animation of one property of one material/object over time.
+ *
+ *  The counterpart of AnimationTrack for everything that is not a bone
+ *  transform: UV scroll, opacity pulse, animated colour, flipbook, visibility.
+ *  Measured corpus-wide before being written (docs/PHASE8_FINDINGS.md Etape 1):
+ *  17 933 embedded NiTextureTransformControllers across 42% of the files, plus
+ *  218 476 .kf links -- this is the single largest body of animation the
+ *  exporter was not carrying.
+ *
+ *  Values are raw NIF values, like every other field here: UV offsets in the
+ *  NIF's own UV convention, rotation in radians, colours linear 0..1. */
+struct MaterialTrack {
+    MaterialTrackTarget target;
+    MaterialTrackProperty property = MaterialTrackProperty::Alpha;
+    /*! Raw NIF type name of the controller this came from, for diagnostics:
+     *  "NiTextureTransformController", "NiAlphaController", ... */
+    std::string controller;
+    /*! NIF TexType slot the UV transform or flipbook applies to (0 = BASE,
+     *  1 = DARK, 2 = DETAIL, 4 = GLOW). -1 for a property with no slot. */
+    int textureSlot = -1;
+    /*! Keys. `values` holds 1 or 3 floats per key depending on `property`;
+     *  ComponentCount() says which. */
+    std::vector<float> times;
+    std::vector<float> values;
+    /*! True when the source was a NiBSplineComp*Interpolator and the keys
+     *  above are a resampling of it rather than authored keys -- the same
+     *  treatment and the same 30 Hz rate Phase 4 applies to transforms. */
+    bool wasResampledFromBSpline = false;
+    /*! NiFlipController only: the ordered texture list `TextureIndex` indexes
+     *  into, and the authored time between two flips. */
+    std::vector<FlipTexture> flipTextures;
+    float flipDelta = 0.0f;
+
+    int ComponentCount() const {
+        switch (property) {
+            case MaterialTrackProperty::AmbientColor:
+            case MaterialTrackProperty::DiffuseColor:
+            case MaterialTrackProperty::SpecularColor:
+            case MaterialTrackProperty::EmissiveColor:
+                return 3;
+            default:
+                return 1;
+        }
+    }
+};
+
+/*! Corpus-wide measurements about material/UV/visibility animation. */
+struct MaterialAnimationStats {
+    long long controllersSeen = 0;
+    long long tracksEmitted = 0;
+    long long keysWritten = 0;
+    long long tracksResolved = 0;
+    long long tracksOrphaned = 0;
+    /*! A controller registered on an object but carrying no interpolator or
+     *  no data block. Normal, not a failure: in this corpus the .nif holds the
+     *  stub and the companion .kf supplies the curve (measured: all 2309
+     *  NiVisControllers are like this). */
+    long long controllersInert = 0;
+    /*! Tracks dropped because every key held the same value -- they animate
+     *  nothing and cost bytes. 70% of the corpus's non-transform .kf tracks
+     *  are like this (docs/PHASE8_FINDINGS.md Etape 1). */
+    long long tracksConstantDropped = 0;
+    /*! NiBSplineCompPoint3Interpolator: niflib models NiBSplinePoint3Interpolator
+     *  as six undecoded floats and generates no sampling for it, so these
+     *  cannot be read at all. Counted rather than silently skipped. */
+    long long bSplinePoint3Unsupported = 0;
+    long long bSplineFloatResampled = 0;
+    /*! A controller type not translated to any MaterialTrackProperty. */
+    long long controllersUnsupported = 0;
+    /*! A .kf link whose nodeName matches more than one geometry -- the same
+     *  name ambiguity Phase 7 6.2 measured for mesh emitters. One track is
+     *  emitted per match. */
+    long long kfAmbiguousTargets = 0;
+
+    void Merge(const MaterialAnimationStats& o) {
+        controllersSeen += o.controllersSeen;
+        tracksEmitted += o.tracksEmitted;
+        keysWritten += o.keysWritten;
+        tracksResolved += o.tracksResolved;
+        tracksOrphaned += o.tracksOrphaned;
+        controllersInert += o.controllersInert;
+        tracksConstantDropped += o.tracksConstantDropped;
+        bSplinePoint3Unsupported += o.bSplinePoint3Unsupported;
+        bSplineFloatResampled += o.bSplineFloatResampled;
+        controllersUnsupported += o.controllersUnsupported;
+        kfAmbiguousTargets += o.kfAmbiguousTargets;
+    }
+};
+
 /*! One animation clip: either an embedded NiControllerSequence-less
  *  NiTransformController/NiMultiTargetTransformController pass (originFile ==
  *  "embedded"), or a whole NiControllerSequence loaded from a .kf file
@@ -555,6 +700,19 @@ struct AnimationClip {
      *  as native keys. */
     bool wasResampledFromBSpline = false;
     std::vector<AnimationTrack> tracks;
+
+    /*! Material / UV / visibility animation of this same clip -- see
+     *  MaterialTrack. Kept as a separate vector from `tracks` rather than
+     *  widening AnimationTrack: the two have different targets (a bone vs a
+     *  geometry), different value shapes, and a consumer binds them through
+     *  different mechanisms. Empty for a clip that animates transforms only. */
+    std::vector<MaterialTrack> materialTracks;
+
+    /*! True when the clip is meant to repeat. Taken from the sequence's
+     *  NiControllerSequence cycle type for a .kf clip, and always true for the
+     *  implicit clip that carries embedded material controllers -- a glow that
+     *  ondulates has no sequence to belong to and runs permanently. */
+    bool loop = false;
 };
 
 /*! One color/alpha keyframe of a particle system's color-over-life curve

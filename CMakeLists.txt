@@ -81,6 +81,7 @@ add_executable(gfnif-export
     src/export/GfxFormatWriter.cpp
     src/nif/AnimationExtractor.cpp
     src/nif/HeaderNormalizer.cpp
+    src/nif/MaterialAnimationExtractor.cpp
     src/nif/MaterialExtractor.cpp
     src/nif/MeshExtractor.cpp
     src/nif/NameClassifier.cpp
@@ -140,4 +141,14 @@ target_include_directories(measure-phase7 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(measure-phase7 PRIVATE niflib_static)
 if(MSVC)
     target_compile_options(measure-phase7 PRIVATE /permissive-)
+endif()
+
+add_executable(measure-material-controllers EXCLUDE_FROM_ALL
+    tools/diag/measure_material_controllers.cpp
+    src/nif/HeaderNormalizer.cpp
+)
+target_include_directories(measure-material-controllers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(measure-material-controllers PRIVATE niflib_static)
+if(MSVC)
+    target_compile_options(measure-material-controllers PRIVATE /permissive-)
 endif()

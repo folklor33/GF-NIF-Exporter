@@ -56,12 +56,18 @@ public:
      *  `geometryIndex` maps each NiAVObject the mesh walk exported to where it
      *  landed, so a NiPSysMeshEmitter's block links resolve to an unambiguous
      *  array index rather than to a name several meshes share -- see
+     *  `outSystemIndex`, when non-null, records where each NiParticleSystem
+     *  block landed in scene.particleSystems -- the same block-identity
+     *  mechanism, used by MaterialAnimationExtractor to attach a colour or
+     *  alpha track to the right system rather than to a shared name.
+     *
      *  MeshEmitterRef and docs/PHASE7_FINDINGS.md 6.2. Passing nullptr keeps
      *  the names but leaves every MeshEmitterRef at -1. */
     void Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                  const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
                  SceneData& scene, ParticleStats& stats,
-                 const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex = nullptr);
+                 const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex = nullptr,
+                 std::map<Niflib::NiAVObject*, int>* outSystemIndex = nullptr);
 
     /*! Scans every NiPSysMeshEmitter reachable from `blocks` and returns the
      *  set of geometry names its meshEmitterMeshNames reference.

@@ -2,6 +2,7 @@
 
 #include "nif/AnimationExtractor.hpp"
 #include "nif/HeaderNormalizer.hpp"
+#include "nif/MaterialAnimationExtractor.hpp"
 #include "nif/MaterialExtractor.hpp"
 #include "nif/NameClassifier.hpp"
 #include "nif/ParticleExtractor.hpp"
@@ -601,25 +602,6 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
 
         const size_t clipsBefore = scene.animations.size();
 
-        for (const NiObjectRef& b : blocks) {
-            NiObject* obj = static_cast<NiObject*>(b);
-            if (referenced.find(obj) != referenced.end()) {
-                continue;
-            }
-            if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
-                animExtractor.ExtractEmbedded(av, skeleton, nodesPtr, scene, result.animation);
-            }
-        }
-
-        std::string kfPath;
-        if (ResolveCompanionKf(nifPath, kfPath)) {
-            ++result.animation.kfFilesFound;
-            if (!animExtractor.ExtractFromKf(kfPath, skeleton, nodesPtr, scene, result.animation)) {
-                result.warnings.push_back("companion .kf '" + kfPath +
-                                          "' could not be parsed; its animations are missing");
-            }
-        }
-
         // Particle systems (Phase 5), resolved against the same
         // skeleton/node list animation just used. Unlike animation, a
         // particle system's attach point needs resolving whether or not
@@ -630,6 +612,14 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         // PHASE5_FINDINGS). nodesPtr/skeleton are already built above
         // unconditionally when skeleton == nullptr, so this costs nothing
         // extra to attempt.
+        //
+        // Runs BEFORE the animation passes (it used to run after): Phase 8's
+        // material tracks need to address a particle system by index, so the
+        // systems must exist before a colour or alpha controller is resolved
+        // against them. Nothing in the particle pass depends on animation, and
+        // the two write to separate vectors, so the exported .gfmodel is
+        // unaffected by the swap.
+        std::map<Niflib::NiAVObject*, int> particleSystemIndex;
         const size_t particlesBefore = scene.particleSystems.size();
         {
             ParticleExtractor particleExtractor(&result.warnings);
@@ -640,12 +630,59 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
                 }
                 if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
                     particleExtractor.Extract(av, skeleton, nodesPtr, materials, scene,
-                                              result.particles, &geometryIndex);
+                                              result.particles, &geometryIndex,
+                                              &particleSystemIndex);
                 }
             }
         }
         if (scene.particleSystems.size() > particlesBefore) {
             result.particles.filesWithParticles = 1;
+        }
+
+        // --- transforms, then material / UV / visibility (Phase 8) ---------
+        MaterialTrackTargetIndex materialTargets;
+        materialTargets.geometry = &geometryIndex;
+        materialTargets.particleSystems = &particleSystemIndex;
+        materialTargets.nodes = nodesPtr != nullptr ? &objectToNodeIndex : nullptr;
+        materialTargets.skeleton = skeleton;
+        materialTargets.meshes = &scene.meshes;
+        materialTargets.emitterMeshes = &scene.emitterMeshes;
+        materialTargets.particleSystemData = &scene.particleSystems;
+        materialTargets.sceneNodes = nodesPtr;
+
+        MaterialAnimationExtractor materialAnim(resolver, &result.warnings);
+
+        for (const NiObjectRef& b : blocks) {
+            NiObject* obj = static_cast<NiObject*>(b);
+            if (referenced.find(obj) != referenced.end()) {
+                continue;
+            }
+            if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
+                animExtractor.ExtractEmbedded(av, skeleton, nodesPtr, scene, result.animation);
+            }
+        }
+
+        // Embedded material controllers are not reachable from the roots the
+        // transform walk uses: they hang off NiProperty blocks, which are not
+        // NiAVObjects and so are not children of anything. The whole block
+        // list is passed instead.
+        {
+            std::vector<NiObject*> allBlocks;
+            allBlocks.reserve(blocks.size());
+            for (const NiObjectRef& b : blocks) allBlocks.push_back(static_cast<NiObject*>(b));
+            materialAnim.ExtractEmbedded(allBlocks, materialTargets, scene,
+                                         result.materialAnimation);
+        }
+
+        std::string kfPath;
+        if (ResolveCompanionKf(nifPath, kfPath)) {
+            ++result.animation.kfFilesFound;
+            if (!animExtractor.ExtractFromKf(kfPath, skeleton, nodesPtr, scene, result.animation,
+                                             &materialAnim, &materialTargets,
+                                             &result.materialAnimation)) {
+                result.warnings.push_back("companion .kf '" + kfPath +
+                                          "' could not be parsed; its animations are missing");
+            }
         }
 
         // Correctif measurement: of every meshEmitterMeshNames reference just
@@ -677,8 +714,24 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         // original reason) OR a particle system's attach/emitter/gravity
         // object did (this phase's addition) -- every other skeleton-less
         // file (the large majority) keeps scene.nodes empty.
+        // A material track resolved against the node list counts too: a
+        // NiVisController sits on a plain NiNode in 2308 of its 2309 corpus
+        // instances, so dropping the list would leave every one of them
+        // pointing at an array the file does not carry.
+        bool materialTrackNeedsNodes = false;
+        for (const AnimationClip& clip : scene.animations) {
+            for (const MaterialTrack& mt : clip.materialTracks) {
+                if (mt.target.array == MaterialTrackTarget::Array::Nodes && mt.target.index >= 0) {
+                    materialTrackNeedsNodes = true;
+                    break;
+                }
+            }
+            if (materialTrackNeedsNodes) break;
+        }
+
         if (nodesPtr != nullptr &&
-            (scene.animations.size() > clipsBefore || scene.particleSystems.size() > particlesBefore)) {
+            (scene.animations.size() > clipsBefore ||
+             scene.particleSystems.size() > particlesBefore || materialTrackNeedsNodes)) {
             // Reattach every mesh whose own node (or an ancestor of it) is
             // actually the target of a resolved track. Without this, a track
             // moves an empty SceneNode pivot while the mesh's geometry --

@@ -12,6 +12,9 @@
 // bone names against.
 
 #include "export/SceneModel.hpp"
+// For the optional material-track pass ExtractFromKf runs on the same parsed
+// sequences, rather than re-reading and re-parsing every .kf a second time.
+#include "nif/MaterialAnimationExtractor.hpp"
 
 #include <map>
 #include <string>
@@ -81,7 +84,10 @@ public:
      *  parsed at all -- a bad individual track never fails the whole load. */
     bool ExtractFromKf(const std::string& kfPath, const SkeletonData* skeleton,
                        const std::vector<SceneNode>* nodes, SceneData& scene,
-                       AnimationStats& stats);
+                       AnimationStats& stats,
+                       MaterialAnimationExtractor* materialAnimation = nullptr,
+                       const MaterialTrackTargetIndex* materialTargets = nullptr,
+                       MaterialAnimationStats* materialStats = nullptr);
 
 private:
     std::vector<std::string>* warnings_;

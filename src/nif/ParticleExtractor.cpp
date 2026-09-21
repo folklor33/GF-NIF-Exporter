@@ -362,7 +362,8 @@ std::set<std::string> ParticleExtractor::CollectMeshEmitterNames(
 void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                                 const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
                                 SceneData& scene, ParticleStats& stats,
-                                const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex) {
+                                const std::map<Niflib::NiAVObject*, MeshEmitterRef>* geometryIndex,
+                                std::map<Niflib::NiAVObject*, int>* outSystemIndex) {
     if (root == nullptr) return;
 
     // Collect every NiParticleSystem reachable from `root`, the same
@@ -594,6 +595,9 @@ void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* sk
         }
 
         ++stats.systemsTotal;
+        if (outSystemIndex != nullptr) {
+            (*outSystemIndex)[ps] = static_cast<int>(scene.particleSystems.size());
+        }
         scene.particleSystems.push_back(std::move(data));
     }
 }

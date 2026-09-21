@@ -258,6 +258,7 @@ int RunPipeline(const Options& options, Logger& logger, RunSummary& summary) {
         summary.bones += r.boneCount;
         summary.clips += r.clipCount;
         summary.particleSystems += r.particleSystemCount;
+        summary.materialAnimation.Merge(r.extraction.materialAnimation);
         summary.bytesWritten += r.bytesWritten;
         summary.texturesResolved += r.texturesResolved;
         summary.texturesMissing += r.texturesMissing;
@@ -321,6 +322,23 @@ bool WriteJsonReport(const std::string& path, const Options& options, const RunS
     out << "    \"bones\": " << summary.bones << ",\n";
     out << "    \"animationClips\": " << summary.clips << ",\n";
     out << "    \"particleSystems\": " << summary.particleSystems << ",\n";
+    // Phase 8: material / UV / visibility animation.
+    out << "    \"materialTracks\": " << summary.materialAnimation.tracksEmitted << ",\n";
+    out << "    \"materialTrackKeys\": " << summary.materialAnimation.keysWritten << ",\n";
+    out << "    \"materialTracksResolved\": " << summary.materialAnimation.tracksResolved << ",\n";
+    out << "    \"materialTracksOrphaned\": " << summary.materialAnimation.tracksOrphaned << ",\n";
+    out << "    \"materialControllersInert\": " << summary.materialAnimation.controllersInert
+        << ",\n";
+    out << "    \"materialTracksConstantDropped\": "
+        << summary.materialAnimation.tracksConstantDropped << ",\n";
+    out << "    \"materialTracksAmbiguousByName\": " << summary.materialAnimation.kfAmbiguousTargets
+        << ",\n";
+    out << "    \"materialBSplineFloatResampled\": "
+        << summary.materialAnimation.bSplineFloatResampled << ",\n";
+    out << "    \"materialBSplinePoint3Unsupported\": "
+        << summary.materialAnimation.bSplinePoint3Unsupported << ",\n";
+    out << "    \"materialControllersUnsupported\": "
+        << summary.materialAnimation.controllersUnsupported << ",\n";
     out << "    \"filesWithSkeleton\": " << summary.filesWithSkeleton << ",\n";
     out << "    \"filesWithAnimation\": " << summary.filesWithAnimation << ",\n";
     out << "    \"filesWithParticles\": " << summary.filesWithParticles << ",\n";

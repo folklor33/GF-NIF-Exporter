@@ -23,6 +23,9 @@ struct RunSummary {
     std::size_t bones = 0;
     std::size_t clips = 0;
     std::size_t particleSystems = 0;
+    /*! Material / UV / visibility animation (Phase 8), so the corpus-wide
+     *  result is readable off a run rather than only off the diag probe. */
+    MaterialAnimationStats materialAnimation;
     std::size_t filesWithSkeleton = 0;
     std::size_t filesWithAnimation = 0;
     std::size_t filesWithParticles = 0;

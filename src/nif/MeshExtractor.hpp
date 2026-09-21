@@ -44,6 +44,10 @@ struct ExtractionResult {
     /*! Particle-system measurements for this file, merged into a corpus total
      *  by the caller. */
     ParticleStats particles;
+
+    /*! Material / UV / visibility animation measurements (Phase 8), merged
+     *  into a corpus total by the caller. */
+    MaterialAnimationStats materialAnimation;
 };
 
 /*! True if `nifPath` (a .nif under a `<type>/model/` directory) has a

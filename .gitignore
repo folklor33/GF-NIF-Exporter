@@ -4,6 +4,7 @@ build-asan/
 out/
 out_test2/
 out-v4/
+out-v4-baseline/
 *.user
 
 # Visual Studio

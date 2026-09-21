@@ -598,7 +598,10 @@ void AnimationExtractor::ExtractEmbedded(Niflib::NiAVObject* root, const Skeleto
 
 bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const SkeletonData* skeleton,
                                        const std::vector<SceneNode>* nodes, SceneData& scene,
-                                       AnimationStats& stats) {
+                                       AnimationStats& stats,
+                                       MaterialAnimationExtractor* materialAnimation,
+                                       const MaterialTrackTargetIndex* materialTargets,
+                                       MaterialAnimationStats* materialStats) {
     std::string bytes;
     if (!ReadWholeFile(kfPath, bytes)) {
         return false;
@@ -650,6 +653,10 @@ bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const Skeleton
         clip.originFile = kfFileName;
         clip.name = seq->GetName();
         clip.durationSeconds = std::max(0.0f, seq->GetStopTime() - seq->GetStartTime());
+        // CYCLE_LOOP is niflib's value 0; anything else clamps or reverses.
+        // Carried through so a consumer does not have to guess whether a glow
+        // pulse repeats -- see AnimationClip::loop.
+        clip.loop = seq->GetCycleType() == Niflib::CYCLE_LOOP;
 
         for (const Niflib::ControllerLink& link : seq->GetControllerData()) {
             if (link.interpolator == NULL) {
@@ -692,7 +699,18 @@ bool AnimationExtractor::ExtractFromKf(const std::string& kfPath, const Skeleton
             clip.tracks.push_back(std::move(track));
         }
 
-        if (!clip.tracks.empty()) {
+        // Material / UV / visibility tracks of this same sequence, added to
+        // the clip the transform pass just built so a consumer gets one clip
+        // carrying both. Runs on the already-parsed sequence rather than
+        // re-reading the .kf: the corpus has 1447 of them and Phase 6
+        // measured the pipeline CPU-bound, so a second parse would be the
+        // single most expensive thing this change could do.
+        if (materialAnimation != nullptr && materialTargets != nullptr &&
+            materialStats != nullptr) {
+            materialAnimation->ExtractFromSequence(seq, *materialTargets, clip, *materialStats);
+        }
+
+        if (!clip.tracks.empty() || !clip.materialTracks.empty()) {
             for (const AnimationTrack& t : clip.tracks) {
                 stats.totalKeyframesWritten += static_cast<long long>(
                     t.translations.size() + t.rotations.size() + t.scales.size());

@@ -73,6 +73,41 @@ std::string Vec3Json(const float (&v)[3]) {
 
 /*! Serialises a column-major 4x4 as a flat JSON array, in the element order
  *  THREE.Matrix4.fromArray expects. */
+/*! Stable JSON names for MaterialTrackProperty. Spelled out rather than
+ *  written as the enum's integer value: a consumer switches on these, and a
+ *  number would make the .gfmodel unreadable without this header. */
+const char* MaterialPropertyName(MaterialTrackProperty p) {
+    switch (p) {
+        case MaterialTrackProperty::UvTranslateU: return "uvTranslateU";
+        case MaterialTrackProperty::UvTranslateV: return "uvTranslateV";
+        case MaterialTrackProperty::UvRotation: return "uvRotation";
+        case MaterialTrackProperty::UvScaleU: return "uvScaleU";
+        case MaterialTrackProperty::UvScaleV: return "uvScaleV";
+        case MaterialTrackProperty::Alpha: return "alpha";
+        case MaterialTrackProperty::AmbientColor: return "ambientColor";
+        case MaterialTrackProperty::DiffuseColor: return "diffuseColor";
+        case MaterialTrackProperty::SpecularColor: return "specularColor";
+        case MaterialTrackProperty::EmissiveColor: return "emissiveColor";
+        case MaterialTrackProperty::Visible: return "visible";
+        case MaterialTrackProperty::TextureIndex: return "textureIndex";
+    }
+    return "unknown";
+}
+
+/*! Which top-level array a MaterialTrackTarget::index points into. The name
+ *  matches the .gfmodel key exactly, so a consumer indexes `doc[array][index]`
+ *  with no lookup table. */
+const char* MaterialTargetArrayName(MaterialTrackTarget::Array a) {
+    switch (a) {
+        case MaterialTrackTarget::Array::Meshes: return "meshes";
+        case MaterialTrackTarget::Array::EmitterMeshes: return "emitterMeshes";
+        case MaterialTrackTarget::Array::ParticleSystems: return "particleSystems";
+        case MaterialTrackTarget::Array::Nodes: return "nodes";
+        case MaterialTrackTarget::Array::Bones: return "bones";
+    }
+    return "meshes";
+}
+
 std::string Mat4Json(const float (&m)[16]) {
     std::ostringstream out;
     out << "[";
@@ -250,6 +285,23 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         }
     }
 
+    // Material / UV / visibility tracks (Phase 8), written into the same
+    // buffer after the transform keys, with the same times/values split --
+    // a consumer binds them through a different mechanism than bone tracks
+    // but reads them with the identical accessor code.
+    std::vector<std::vector<ChannelRange>> materialRanges(scene.animations.size());
+    for (size_t ci = 0; ci < scene.animations.size(); ++ci) {
+        const AnimationClip& clip = scene.animations[ci];
+        materialRanges[ci].resize(clip.materialTracks.size());
+        for (size_t mi = 0; mi < clip.materialTracks.size(); ++mi) {
+            const MaterialTrack& t = clip.materialTracks[mi];
+            ChannelRange& r = materialRanges[ci][mi];
+            r.count = t.times.size();
+            r.timeOffset = AppendFloats(bin, t.times.data(), t.times.size());
+            r.valueOffset = AppendFloats(bin, t.values.data(), t.values.size());
+        }
+    }
+
     {
         std::ofstream out(binPath, std::ios::binary);
         if (!out) {
@@ -267,7 +319,7 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::ostringstream js;
     js << "{\n";
     js << "  \"formatVersion\": " << kGfModelFormatVersion << ",\n";
-    js << "  \"generator\": \"gfnif-export (phase 7 correctif)\",\n";
+    js << "  \"generator\": \"gfnif-export (phase 8)\",\n";
     js << "  \"sourceNif\": \"" << JsonEscape(scene.sourceNifPath) << "\",\n";
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
@@ -456,6 +508,44 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
             // PHASE3_FINDINGS), not a 3-component vector like translation.
             js << "          \"scale\": " << channelJson("", r.scales, 1) << "\n";
             js << "        }" << (ti + 1 < clip.tracks.size() ? "," : "") << "\n";
+        }
+        js << "      ],\n";
+
+        // Material / UV / visibility animation (format 5). `target` names the
+        // array and index to apply the track to -- never a material index,
+        // see MaterialTrackTarget. `values` holds itemSize floats per key.
+        js << "      \"loop\": " << (clip.loop ? "true" : "false") << ",\n";
+        js << "      \"materialTracks\": [\n";
+        for (size_t mi = 0; mi < clip.materialTracks.size(); ++mi) {
+            const MaterialTrack& t = clip.materialTracks[mi];
+            const ChannelRange& r = materialRanges[ci][mi];
+            const int items = t.ComponentCount();
+            js << "        {\n";
+            js << "          \"target\": {\"array\": \""
+               << MaterialTargetArrayName(t.target.array) << "\", \"index\": " << t.target.index
+               << ", \"name\": \"" << JsonEscape(t.target.name) << "\"},\n";
+            js << "          \"property\": \"" << MaterialPropertyName(t.property) << "\",\n";
+            js << "          \"controller\": \"" << JsonEscape(t.controller) << "\",\n";
+            js << "          \"textureSlot\": " << t.textureSlot << ",\n";
+            js << "          \"wasResampledFromBSpline\": "
+               << (t.wasResampledFromBSpline ? "true" : "false") << ",\n";
+            if (!t.flipTextures.empty()) {
+                js << "          \"flipDelta\": " << Num(t.flipDelta) << ",\n";
+                js << "          \"flipTextures\": [";
+                for (size_t f = 0; f < t.flipTextures.size(); ++f) {
+                    const FlipTexture& ft = t.flipTextures[f];
+                    js << (f ? ", " : "") << "{\"path\": \"" << JsonEscape(ft.path)
+                       << "\", \"sourceTextureName\": \"" << JsonEscape(ft.sourceTextureName)
+                       << "\", \"found\": " << (ft.found ? "true" : "false") << "}";
+                }
+                js << "],\n";
+            }
+            js << "          \"count\": " << r.count << ",\n";
+            js << "          \"times\": {\"byteOffset\": " << r.timeOffset
+               << ", \"itemSize\": 1, \"count\": " << r.count << ", \"type\": \"float32\"},\n";
+            js << "          \"values\": {\"byteOffset\": " << r.valueOffset << ", \"itemSize\": "
+               << items << ", \"count\": " << r.count << ", \"type\": \"float32\"}\n";
+            js << "        }" << (mi + 1 < clip.materialTracks.size() ? "," : "") << "\n";
         }
         js << "      ]\n";
         js << "    }" << (ci + 1 < scene.animations.size() ? "," : "") << "\n";
