@@ -473,6 +473,9 @@ int RunExport(const std::vector<std::string>& args) {
               << " GrowFade, " << particleStats.modifiersColor << " Color ("
               << particleStats.modifiersColorKeysMissing << " missing data), "
               << particleStats.modifiersUnsupported << " unrecognised\n";
+    std::cout << "Mesh emitter surfaces: " << particleStats.meshEmitterNameRefsHiddenKept << "/"
+              << particleStats.meshEmitterNameRefs << " resolved ("
+              << particleStats.meshEmitterNameRefsUnresolved << " unresolved)\n";
 
     if (!orphanBoneNames.empty()) {
         std::vector<std::pair<std::string, int>> orphans(orphanBoneNames.begin(),

@@ -427,3 +427,115 @@ marker parented under an animated bone moves with it during clip playback.
 If you have NifSkope available, the four comparisons in §8 would give an
 independent confirmation of the extracted values beyond this session's own
 structural checks.
+
+---
+
+## 12. Correctif — emitter meshes filtered out by the Phase 3 visibility gate
+
+**Confirmed on the full corpus.** A `NiPSysMeshEmitter` emits from the
+surface of one or more meshes (`meshEmitterMeshNames`), referenced by name.
+Those meshes are almost always marked not-visible in the source file (they
+are an emission volume, not something meant to render), so Phase 3's
+unconditional hidden-geometry filter (`MeshExtractor.cpp`, `GetVisibility()
+== false`, added for M491's opaque panel problem, §13 of PHASE3_FINDINGS)
+was silently dropping them. A particle system referencing that name then
+resolved to nothing, and a viewer/loader fell back to the emitter's own
+attach-node origin — the "markers lined up at bone origins, off the model"
+symptom reported for a `ride/` mount file.
+
+**Measured, full corpus (2825 .nif files scanned, `tools/diag/
+measure_emitter_meshes.cpp`):** 5589 `meshEmitterMeshNames` references
+across 1113 files. **1865 of them (33.4%) point at a shape the source file
+marks hidden.** Name resolution itself is not the problem: every single
+reference resolves to a real `NiTriBasedGeom` in its own file (0
+unresolved) — niflib's own ref, not a fuzzy name search. Per-folder: `ride`
+32.3% hidden, `item` 35.3%, `chair` 22.8%, `npc` 72.6%, `char`/`effect`
+100% (small samples, 4 and 1 refs respectively).
+
+One file (`monster/M156.nif`) crashed the diagnostic — traced to niflib's
+known crash-not-throw behavior on an unsupported block type
+(`NiPhysXScene`, already handled everywhere else in this codebase via
+`FindUnsupportedBlockType` before `ReadNifList` is ever called,
+`MeshExtractor.cpp` §"niflib crashes rather than throwing cleanly"). The
+diagnostic tool was missing that guard; fixed by reusing the same header
+pre-check. Not a defect in the exporter itself — M156 was already correctly
+reported as a failed file before this session.
+
+**Fix — Option A, a separate `emitterMeshes` list (SceneModel.hpp,
+GfxFormatWriter.cpp):**
+
+* `ParticleExtractor::CollectMeshEmitterNames` (new, static) scans every
+  `NiPSysMeshEmitter` in the file's block list up front — before
+  `WalkNode`'s mesh pass runs — and returns the set of geometry names any
+  emitter references.
+* `MeshExtractor.cpp`'s hidden-geometry filter takes one exception: a
+  hidden shape whose name is in that set is kept, but routed to
+  `SceneData::emitterMeshes` instead of `SceneData::meshes` — never
+  `hiddenGeometriesDropped`. Every other hidden shape is dropped exactly as
+  before (§13 of PHASE3_FINDINGS, unchanged).
+* `GfxFormatWriter.cpp` writes `emitterMeshes` as a second top-level array,
+  same per-mesh shape as `meshes` (attributes/indices in the same `.gfbin`,
+  same accessor format), so a consumer resolves a
+  `ParticleSystemData.emitter.meshEmitterMeshNames` entry by name against
+  `emitterMeshes`, not `meshes` — no existing render path can show these by
+  accident.
+
+**Option B (flag on the existing mesh list) was rejected**: it would put
+the burden of not rendering these shapes on every consumer, and the reason
+Phase 3's filter exists at all is that a mesh not meant to render had
+leaked into the render path once already (M491). A separate array makes
+that structurally impossible instead of relying on discipline.
+
+**Resolution rate after the fix, full corpus: 2023/6111 distinct
+emitter-mesh names resolved (0 unresolved), reported per-file in the
+"particles" summary as `Mesh emitter surfaces: N/M resolved`.** (6111, not
+5589 — this counts distinct names per file, so a name several emitters in
+the same file reference is counted once; the un-deduplicated reference
+count is the 5589 above.) The remaining ~4000 names are the ones already
+visible before the fix (no exception needed) plus a genuine few dropped by
+another filter (helper-gizmo name/texture heuristic, no data block, no
+triangles) — reported as a warning naming the file and the mesh, never a
+failure. 0 such warnings were seen on this run of the full corpus: every
+`meshEmitterMeshNames` reference that resolves to a real geometry block
+made it into the export, either via `meshes` or `emitterMeshes`.
+
+**Non-regression, M491 (the original visibility-filter case, PHASE3_FINDINGS
+§12/§821):** documented baseline is 34 total shapes, 4 hidden, 30 exported.
+This session's export after the fix: still exactly 30 meshes in `meshes`.
+One of M491's five particle systems references a hidden shape by name; it
+is now the sole entry in `emitterMeshes`, still absent from `meshes` — the
+opaque-panel fix is untouched.
+
+**Secondary items from the correctif brief, measured, no fix needed:**
+
+* **`colorKeys` black RGB**: 16 757/18 497 color keys (90.6%) corpus-wide
+  have `[0, 0, 0, alpha]` — not universal, so this is authored variation
+  (an opacity-only profile is common but not the only pattern), not a
+  parsing bug. Left as-is per this phase's "values stay in the NIF's own
+  units, no interpretation" principle (§3); worth an eye in Phase 7 if a
+  system with a black `colorKeys` entry renders invisible under additive
+  blending.
+* **Particle texture resolution**: 6915/6958 particle systems (99.4%) have
+  a `materialIndex` resolving to a material with `textureFound: true` —
+  matches the exporter's own corpus summary. The 43 unresolved match the
+  pre-existing unresolved-texture list (missing `.dds`→`.png` on disk),
+  not a particle-specific gap.
+* **`emitterObjectNodeIndex == attachNodeIndex`**: true for 5006/6958
+  systems (71.9%), **not universal** — the brief's suspicion that one field
+  might be redundant does not hold on the full corpus; the remaining 28.1%
+  genuinely have a distinct emitter-shape-origin node (a sibling
+  "`<name>-Emitter`" NiNode, per §"Emitter Object" in ParticleExtractor.cpp)
+  from their attach parent. Both fields stay.
+
+**What to verify visually:** reload the `ride/` mount `.gfmodel` that
+originally showed the line-of-markers symptom in `tools/viewer/index.html`.
+The markers themselves were already correct (bone origins are the right
+place for an attach point with no emission surface); what changes is that
+`emitterMeshes` now carries real geometry for the systems that need it, so
+a Phase-7 particle renderer has something to emit from instead of nothing.
+No viewer-visible change is expected in *this* phase's marker positions —
+confirming that would mean this correctif regressed something.
+
+Measurement tool: `tools/diag/measure_emitter_meshes.cpp` (not wired into
+CMake, built ad hoc, same `cl.exe` invocation as §2's tools — see
+PHASE4_FINDINGS §13.7).

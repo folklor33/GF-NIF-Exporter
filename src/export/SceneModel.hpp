@@ -440,6 +440,18 @@ struct ParticleStats {
      *  a type-only boilerplate entry) -- skipped with a warning. */
     int modifiersUnsupported = 0;
 
+    /*! meshEmitterMeshNames references across all NiPSysMeshEmitters --
+     *  correctif measurement, see docs/PHASE5_FINDINGS.md. */
+    int meshEmitterNameRefs = 0;
+    /*! Of those, references to a shape the source file marks hidden --
+     *  kept in scene.emitterMeshes instead of dropped (WalkNode's
+     *  isEmitterSurface exception). */
+    int meshEmitterNameRefsHiddenKept = 0;
+    /*! Of those, references to a name not found among the file's own
+     *  geometry at all -- a genuinely orphaned reference, reported as a
+     *  warning, never a failure. */
+    int meshEmitterNameRefsUnresolved = 0;
+
     void Merge(const ParticleStats& o) {
         filesWithParticles += o.filesWithParticles;
         systemsTotal += o.systemsTotal;
@@ -458,6 +470,9 @@ struct ParticleStats {
         modifiersColorKeysMissing += o.modifiersColorKeysMissing;
         gravityObjectResolved += o.gravityObjectResolved;
         modifiersUnsupported += o.modifiersUnsupported;
+        meshEmitterNameRefs += o.meshEmitterNameRefs;
+        meshEmitterNameRefsHiddenKept += o.meshEmitterNameRefsHiddenKept;
+        meshEmitterNameRefsUnresolved += o.meshEmitterNameRefsUnresolved;
     }
 };
 
@@ -719,6 +734,18 @@ struct SceneData {
      *  none -- measured at 55% of the corpus (PHASE5_FINDINGS), so this is
      *  routinely non-empty, unlike the rarer skeleton/animation cases. */
     std::vector<ParticleSystemData> particleSystems;
+
+    /*! Geometry kept only as an emission surface for a NiPSysMeshEmitter
+     *  (ParticleSystemData::emitter.meshEmitterMeshNames), never for
+     *  rendering. Separate from `meshes` on purpose: these shapes are
+     *  routinely marked hidden in the source file (measured: 33% of
+     *  meshEmitterMeshNames references corpus-wide resolve to a hidden
+     *  shape -- see docs/PHASE5_FINDINGS.md correctif), so the ordinary
+     *  visibility filter would otherwise drop geometry a particle system
+     *  still needs. Kept out of `meshes` so no existing render path shows
+     *  them by accident; a consumer looks a name up here only when
+     *  resolving a mesh emitter's surface. */
+    std::vector<MeshData> emitterMeshes;
 
     /*! Total vertices/triangles across all meshes, for logging. */
     size_t TotalVertices() const {

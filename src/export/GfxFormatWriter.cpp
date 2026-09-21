@@ -108,7 +108,12 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     std::vector<MeshRanges> ranges;
     ranges.reserve(scene.meshes.size());
 
-    for (const MeshData& mesh : scene.meshes) {
+    // Shared by scene.meshes and scene.emitterMeshes: both hold the same
+    // MeshData shape and need identical de-interleaved binary layout. Emitter
+    // meshes are never skinned in the corpus (they are editor helper geometry
+    // marked hidden, not deforming render meshes), but the skin branch is kept
+    // so nothing silently breaks if that ever changes.
+    auto writeMeshBinary = [&](const MeshData& mesh) {
         MeshRanges r;
         std::vector<float> scratch;
 
@@ -175,7 +180,17 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
             bin.push_back('\0');
         }
         r.index = AppendUint32(bin, mesh.indices);
-        ranges.push_back(r);
+        return r;
+    };
+
+    for (const MeshData& mesh : scene.meshes) {
+        ranges.push_back(writeMeshBinary(mesh));
+    }
+
+    std::vector<MeshRanges> emitterRanges;
+    emitterRanges.reserve(scene.emitterMeshes.size());
+    for (const MeshData& mesh : scene.emitterMeshes) {
+        emitterRanges.push_back(writeMeshBinary(mesh));
     }
 
     // Animation keyframes go in the same buffer, after every mesh's data --
@@ -257,10 +272,9 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
     js << "  \"binary\": \"" << JsonEscape(binPath.filename().string()) << "\",\n";
     js << "  \"binaryByteLength\": " << bin.size() << ",\n";
 
-    js << "  \"meshes\": [\n";
-    for (size_t i = 0; i < scene.meshes.size(); ++i) {
-        const MeshData& m = scene.meshes[i];
-        const MeshRanges& r = ranges[i];
+    // Shared by "meshes" and "emitterMeshes" below -- identical per-mesh JSON
+    // shape, addressing whichever MeshRanges the binary pass above computed.
+    auto writeMeshJson = [&](const MeshData& m, const MeshRanges& r) {
         const size_t vcount = m.vertices.size();
 
         js << "    {\n";
@@ -315,7 +329,25 @@ bool WriteSceneFiles(const SceneData& scene, const std::string& outBase, std::st
         js << "      },\n";
         js << "      \"indices\": {\"byteOffset\": " << r.index << ", \"count\": "
            << m.indices.size() << ", \"type\": \"uint32\"}\n";
-        js << "    }" << (i + 1 < scene.meshes.size() ? "," : "") << "\n";
+        js << "    }";
+    };
+
+    js << "  \"meshes\": [\n";
+    for (size_t i = 0; i < scene.meshes.size(); ++i) {
+        writeMeshJson(scene.meshes[i], ranges[i]);
+        js << (i + 1 < scene.meshes.size() ? "," : "") << "\n";
+    }
+    js << "  ],\n";
+
+    // Emission surfaces for a NiPSysMeshEmitter (SceneData::emitterMeshes),
+    // deliberately not in "meshes" so no existing render path shows them --
+    // see docs/PHASE5_FINDINGS.md correctif. A consumer resolves a
+    // ParticleSystemData.emitter.meshEmitterMeshNames entry by name against
+    // this list, not against "meshes".
+    js << "  \"emitterMeshes\": [\n";
+    for (size_t i = 0; i < scene.emitterMeshes.size(); ++i) {
+        writeMeshJson(scene.emitterMeshes[i], emitterRanges[i]);
+        js << (i + 1 < scene.emitterMeshes.size() ? "," : "") << "\n";
     }
     js << "  ],\n";
 

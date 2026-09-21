@@ -280,6 +280,28 @@ Niflib::NiAVObject* FindPtrObject(NiObject* obj) {
 
 ParticleExtractor::ParticleExtractor(std::vector<std::string>* warnings) : warnings_(warnings) {}
 
+std::set<std::string> ParticleExtractor::CollectMeshEmitterNames(
+    const std::vector<Niflib::NiObjectRef>& blocks) {
+    std::set<std::string> names;
+    for (const NiObjectRef& b : blocks) {
+        auto* ps = dynamic_cast<Niflib::NiParticleSystem*>(static_cast<NiObject*>(b));
+        if (ps == nullptr) continue;
+        for (const NiObjectRef& r : ps->GetRefs()) {
+            if (r == NULL) continue;
+            auto* meshEmitter =
+                dynamic_cast<Niflib::NiPSysMeshEmitter*>(static_cast<NiObject*>(r));
+            if (meshEmitter == nullptr) continue;
+            for (const NiObjectRef& mr : meshEmitter->GetRefs()) {
+                if (mr == NULL) continue;
+                if (auto* geo = dynamic_cast<Niflib::NiTriBasedGeom*>(static_cast<NiObject*>(mr))) {
+                    names.insert(geo->GetName());
+                }
+            }
+        }
+    }
+    return names;
+}
+
 void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                                 const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
                                 SceneData& scene, ParticleStats& stats) {
@@ -372,6 +394,7 @@ void ParticleExtractor::Extract(Niflib::NiAVObject* root, const SkeletonData* sk
                         if (mr == NULL) continue;
                         if (auto* geo = dynamic_cast<Niflib::NiTriBasedGeom*>(static_cast<NiObject*>(mr))) {
                             e.meshEmitterMeshNames.push_back(geo->GetName());
+                            ++stats.meshEmitterNameRefs;
                         }
                     }
                     ++stats.emittersMesh;

@@ -15,12 +15,16 @@
 #include "nif/MaterialExtractor.hpp"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace Niflib {
 class NiAVObject;
+class NiObject;
 class NiParticleSystem;
+template <class T> class Ref;
+typedef Ref<NiObject> NiObjectRef;
 } // namespace Niflib
 
 namespace gfnif {
@@ -51,6 +55,18 @@ public:
     void Extract(Niflib::NiAVObject* root, const SkeletonData* skeleton,
                  const std::vector<SceneNode>* nodes, MaterialExtractor& materials,
                  SceneData& scene, ParticleStats& stats);
+
+    /*! Scans every NiPSysMeshEmitter reachable from `blocks` and returns the
+     *  set of geometry names its meshEmitterMeshNames reference.
+     *
+     *  Called before mesh extraction (WalkNode) so a shape's hidden-geometry
+     *  drop (MeshExtractor.cpp) can make an exception for a mesh a particle
+     *  system needs as its emission surface -- see docs/PHASE5_FINDINGS.md,
+     *  "emitter meshes filtered out" correctif. Names, not pointers: this
+     *  runs before any NiAVObject is walked, matching the name-based
+     *  resolution meshEmitterMeshNames itself already uses. */
+    static std::set<std::string> CollectMeshEmitterNames(
+        const std::vector<Niflib::NiObjectRef>& blocks);
 
 private:
     std::vector<std::string>* warnings_;

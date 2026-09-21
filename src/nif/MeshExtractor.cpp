@@ -171,6 +171,7 @@ void WalkNode(Niflib::NiAVObject* obj,
               ExtractionResult& result,
               int depth,
               bool verifyStrips,
+              const std::set<std::string>* emitterMeshNames = nullptr,
               std::vector<Niflib::NiAVObject*>* meshSourceObjects = nullptr) {
     if (obj == nullptr || !visited.insert(obj).second) {
         return;
@@ -193,7 +194,7 @@ void WalkNode(Niflib::NiAVObject* obj,
     if (auto* node = dynamic_cast<Niflib::NiNode*>(obj)) {
         for (const Niflib::Ref<Niflib::NiAVObject>& child : node->GetChildren()) {
             WalkNode(static_cast<Niflib::NiAVObject*>(child), world, scene, materials, skeletons,
-                     visited, result, depth + 1, verifyStrips, meshSourceObjects);
+                     visited, result, depth + 1, verifyStrips, emitterMeshNames, meshSourceObjects);
         }
         return;
     }
@@ -215,7 +216,19 @@ void WalkNode(Niflib::NiAVObject* obj,
     // deleted. There is no case for exporting what the source file itself
     // says not to draw, so this is unconditional: no texture/name gate
     // needed, unlike NameClassifier's filter. See PHASE3_FINDINGS §13.
-    if (!obj->GetVisibility()) {
+    //
+    // Exception: a shape named in emitterMeshNames is a NiPSysMeshEmitter's
+    // emission surface, not render geometry -- it is routinely marked hidden
+    // for exactly that reason (measured: 33% of meshEmitterMeshNames
+    // references corpus-wide resolve to a hidden shape). Dropping it here
+    // would leave the particle system's meshEmitterMeshNames pointing at
+    // nothing. It is kept, but routed to scene.emitterMeshes below instead
+    // of scene.meshes, so no render path picks it up by accident. See
+    // docs/PHASE5_FINDINGS.md correctif.
+    const bool isHidden = !obj->GetVisibility();
+    const bool isEmitterSurface =
+        isHidden && emitterMeshNames != nullptr && emitterMeshNames->count(obj->GetName()) > 0;
+    if (isHidden && !isEmitterSurface) {
         ++result.hiddenGeometriesDropped;
         return;
     }
@@ -355,6 +368,11 @@ void WalkNode(Niflib::NiAVObject* obj,
         }
     }
 
+    if (isEmitterSurface) {
+        scene.emitterMeshes.push_back(std::move(mesh));
+        return;
+    }
+
     scene.meshes.push_back(std::move(mesh));
     if (meshSourceObjects != nullptr) {
         meshSourceObjects->push_back(obj);
@@ -452,6 +470,12 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
     }
 
+    // Names a NiPSysMeshEmitter references as its emission surface, computed
+    // up front (before any shape is walked) so the hidden-geometry filter
+    // below can make an exception for them. See WalkNode's isEmitterSurface
+    // and docs/PHASE5_FINDINGS.md correctif.
+    const std::set<std::string> emitterMeshNames = ParticleExtractor::CollectMeshEmitterNames(blocks);
+
     // Parallel to scene.meshes, recording which NiAVObject each entry came
     // from -- needed only if this file turns out to need the animated-mesh
     // reattachment pass below (see nodesPtr/scene.nodes), so a mesh can be
@@ -467,7 +491,7 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
         if (auto* av = dynamic_cast<Niflib::NiAVObject*>(obj)) {
             WalkNode(av, Matrix44::IDENTITY, scene, materials, skeletons, visited, result, 0,
-                     verifyStrips, &meshSourceObjects);
+                     verifyStrips, &emitterMeshNames, &meshSourceObjects);
         }
     }
 
@@ -604,6 +628,30 @@ ExtractionResult ExtractScene(const std::string& nifPath, SceneData& scene, bool
         }
         if (scene.particleSystems.size() > particlesBefore) {
             result.particles.filesWithParticles = 1;
+        }
+
+        // Correctif measurement: of every meshEmitterMeshNames reference just
+        // extracted, how many actually made it into scene.emitterMeshes (kept
+        // despite being hidden) -- vs. a name that resolved to a real
+        // NiTriBasedGeom in the NIF (ParticleExtractor::Extract only ever
+        // records a name it read off an actual ref, see CollectMeshEmitterNames)
+        // but never appears in the export at all, e.g. because it also failed
+        // the helper-gizmo filter or had no usable data block. The latter is
+        // reported as a warning, never a failure -- PHASE5_FINDINGS correctif.
+        if (!emitterMeshNames.empty()) {
+            std::set<std::string> exportedNames;
+            for (const MeshData& m : scene.emitterMeshes) exportedNames.insert(m.name);
+            for (const MeshData& m : scene.meshes) exportedNames.insert(m.name);
+            for (const std::string& name : emitterMeshNames) {
+                if (exportedNames.count(name) > 0) {
+                    ++result.particles.meshEmitterNameRefsHiddenKept;
+                } else {
+                    ++result.particles.meshEmitterNameRefsUnresolved;
+                    result.warnings.push_back("meshEmitterMeshNames references '" + name +
+                                              "', not present in the export (dropped by another "
+                                              "filter or had no usable geometry)");
+                }
+            }
         }
 
         // A file needs its node list exported (see SceneData::nodes) when
