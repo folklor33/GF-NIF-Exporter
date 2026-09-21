@@ -152,3 +152,23 @@ target_link_libraries(measure-material-controllers PRIVATE niflib_static)
 if(MSVC)
     target_compile_options(measure-material-controllers PRIVATE /permissive-)
 endif()
+
+add_executable(measure-rigid-bone-children EXCLUDE_FROM_ALL
+    tools/diag/measure_rigid_bone_children.cpp
+    src/nif/HeaderNormalizer.cpp
+)
+target_include_directories(measure-rigid-bone-children PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(measure-rigid-bone-children PRIVATE niflib_static)
+if(MSVC)
+    target_compile_options(measure-rigid-bone-children PRIVATE /permissive-)
+endif()
+
+add_executable(measure-sujet-bc EXCLUDE_FROM_ALL
+    tools/diag/measure_sujet_bc.cpp
+    src/nif/HeaderNormalizer.cpp
+)
+target_include_directories(measure-sujet-bc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(measure-sujet-bc PRIVATE niflib_static)
+if(MSVC)
+    target_compile_options(measure-sujet-bc PRIVATE /permissive-)
+endif()

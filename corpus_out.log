@@ -1,0 +1,8 @@
+Files with a skeleton: 1466
+  of which >=1 rigid mesh has a bone ancestor: 498
+Total rigid meshes in skeleton files: 16349
+Total rigid meshes with a bone ancestor: 8458
+  direct bone parent (0 intermediates): 920
+  with >=1 intermediate non-bone node:  7538
+    of which >=1 intermediate is animated (has NiTransformController): 273
+    of which >=1 intermediate is a NiBillboardNode: 2960
